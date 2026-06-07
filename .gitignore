@@ -5,3 +5,4 @@ data/
 checkpoints/
 wandb/
 .DS_Store
+.env

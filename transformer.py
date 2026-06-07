@@ -1,9 +1,35 @@
+import os
 import time
 import tiktoken
 import jax
 import jax.numpy as jnp
 import optax
-import wandb
+
+# Load environment variables from local .env if it exists
+if os.path.exists(".env"):
+    with open(".env", "r") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                key, val = line.split("=", 1)
+                os.environ[key.strip()] = val.strip()
+
+if os.environ.get("WANDB_MODE") == "disabled":
+    class MockWandb:
+        @staticmethod
+        def init(*args, **kwargs):
+            class Run:
+                def log(self, *args, **kwargs): pass
+                def finish(self, *args, **kwargs): pass
+            return Run()
+        @staticmethod
+        def log(*args, **kwargs): pass
+        @staticmethod
+        def finish(*args, **kwargs): pass
+    wandb = MockWandb()
+else:
+    import wandb
+
 from flax import nnx
 
 
@@ -228,6 +254,7 @@ max_steps = 50
 
 wandb.init(
     project="nano-gpt-jax",
+    mode=os.environ.get("WANDB_MODE", "offline"),
     config={
         "n_layer": config.n_layer,
         "n_head": config.n_head,
