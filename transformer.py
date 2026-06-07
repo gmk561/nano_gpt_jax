@@ -1,14 +1,18 @@
-from flax.nnx import variablelib
-from ast import mod
 import time
 import tiktoken
 import jax
 import jax.numpy as jnp
 import optax
+import wandb
 from flax import nnx
 
 
-sequence_length = 32
+SEQUENCE_LENGTH = 1024
+BATCH_SIZE = 16
+MATMUL_PRECISION = "tensorfloat32"
+
+
+jax.config.update("jax_default_matmul_precision", MATMUL_PRECISION)
 
 
 class GPTConfig:
@@ -84,11 +88,16 @@ class GPT(nnx.Module):
                 return True
             return False
 
-        def _apply(module, parent=None, attr_name=None):
+        def _apply(module, parent=None, _attr_name=None):
+            # Mixed precision: use bfloat16 for faster computation, weights remain float32, activations are bfloat16
+            # don't apply to LayerNorm as it sums many values, this can lead to overflow or underflow.
+            if isinstance(module, (nnx.Linear, nnx.MultiHeadAttention)):
+                module.dtype = jnp.bfloat16
+
             if isinstance(module, nnx.Linear):
                 stddev = (
                     0.02
-                    if not _is_residual_output(module, parent, attr_name)
+                    if not _is_residual_output(module, parent, _attr_name)
                     else 0.02 * residual_scale
                 )
                 module.kernel.value = nnx.initializers.normal(stddev=stddev)(
@@ -183,10 +192,10 @@ class DataLoader:
 
 # ── Training setup ──────────────────────────────────────────────────────────
 
-dataset = DataLoader(batch_size=4, sequence_length=sequence_length)
+dataset = DataLoader(batch_size=BATCH_SIZE, sequence_length=SEQUENCE_LENGTH)
 
 config = GPTConfig()
-config.block_size = sequence_length
+config.block_size = SEQUENCE_LENGTH
 config.vocab_size = dataset.vocab_size  # derived from the actual characters in the text
 rngs = nnx.Rngs(0)
 model = GPT(config, rngs=rngs)
@@ -217,14 +226,40 @@ def train_step(model: GPT, optimizer: nnx.Optimizer, x: jnp.ndarray, y: jnp.ndar
 
 max_steps = 50
 
-# nnx.display(model)
+wandb.init(
+    project="nano-gpt-jax",
+    config={
+        "n_layer": config.n_layer,
+        "n_head": config.n_head,
+        "n_embd": config.n_embd,
+        "block_size": config.block_size,
+        "vocab_size": config.vocab_size,
+        "batch_size": BATCH_SIZE,
+        "sequence_length": SEQUENCE_LENGTH,
+        "learning_rate": learning_rate,
+        "matmul_precision": MATMUL_PRECISION,
+        "max_steps": max_steps,
+    },
+)
 
-x, y = dataset.__next__()
-
-for step, (x0, y0) in enumerate(dataset):
+for step, (x, y) in enumerate(dataset):
     if step >= max_steps:
         break
     t0 = time.time()
     loss = train_step(model, optimizer, x, y)
+    loss.block_until_ready()
     dt = time.time() - t0
-    print(f"step {step:4d} | loss {loss:.4f} | time {dt * 1000:.2f} ms")
+    tokens_per_sec = dataset.sequence_length * dataset.batch_size / dt
+    wandb.log(
+        {
+            "loss": loss.item(),
+            "step_time_ms": dt * 1000,
+            "tokens_per_sec": tokens_per_sec,
+        },
+        step=step,
+    )
+    print(
+        f"step {step:4d} | loss {loss:.4f} | time {dt * 1000:.2f} ms | tokens/sec {tokens_per_sec:.2f}"
+    )
+
+wandb.finish()
