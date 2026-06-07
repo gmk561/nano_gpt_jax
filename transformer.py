@@ -270,7 +270,14 @@ dtype_report(model)
 
 learning_rate = 1e-3
 
-optimizer = nnx.Optimizer(model, optax.adam(learning_rate), wrt=nnx.Param)
+optimizer = nnx.Optimizer(
+    model, 
+    optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(learning_rate, b1=0.9, b2=0.95, eps=1e-8)
+    ), 
+    wrt=nnx.Param
+)
 
 
 def loss_fn(model: GPT, x: jnp.ndarray, y: jnp.ndarray):
