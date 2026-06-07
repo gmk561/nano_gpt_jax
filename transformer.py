@@ -268,13 +268,24 @@ def dtype_report(model: nnx.Module):
 dtype_report(model)
 
 
-learning_rate = 1e-3
+learning_rate = 6e-4
+warmup_steps = 10
+decay_steps = 50 - warmup_steps
+
+schedule = optax.warmup_cosine_decay_schedule(
+    init_value=0.0,      
+    peak_value=learning_rate,
+    warmup_steps=warmup_steps, 
+    decay_steps=decay_steps,  
+    end_value = learning_rate * 0.1, 
+)
+
 
 optimizer = nnx.Optimizer(
     model, 
     optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adamw(learning_rate, b1=0.9, b2=0.95, eps=1e-8)
+        optax.adamw(schedule, b1=0.9, b2=0.95, eps=1e-8, weight_decay=0.1)
     ), 
     wrt=nnx.Param
 )
@@ -332,11 +343,12 @@ for step, (x, y) in enumerate(dataset):
             "loss": loss.item(),
             "step_time_ms": dt * 1000,
             "tokens_per_sec": tokens_per_sec,
+            "learning_rate": schedule(optimizer.step[...]).item(),
         },
         step=step,
     )
     print(
-        f"step {step:4d} | loss {loss:.4f} | time {dt * 1000:.2f} ms | tokens/sec {tokens_per_sec:.2f}"
+        f"step {step:4d} | loss {loss:.4f} | lr: {schedule(optimizer.step[...]):.4f} | time {dt * 1000:.2f} ms | tokens/sec {tokens_per_sec:.2f}"
     )
 
 wandb.finish()
