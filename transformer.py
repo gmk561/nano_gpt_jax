@@ -4,6 +4,14 @@ import tiktoken
 import jax
 import jax.numpy as jnp
 import optax
+from functools import partial
+from flax import nnx
+from typing import Callable
+
+
+
+print("jax.device_count():", jax.device_count())
+
 
 # Load environment variables from local .env if it exists
 if os.path.exists(".env"):
@@ -30,15 +38,10 @@ if os.environ.get("WANDB_MODE") == "disabled":
 else:
     import wandb
 
-from flax import nnx
-
 
 SEQUENCE_LENGTH = 1024
 BATCH_SIZE = 16
-MATMUL_PRECISION = "tensorfloat32"
-
-
-jax.config.update("jax_default_matmul_precision", MATMUL_PRECISION)
+APPLY_DTYPE_POLICY = True
 
 
 class GPTConfig:
@@ -48,12 +51,17 @@ class GPTConfig:
     n_head: int = 6
     n_embd: int = 384
 
+    # dtype policy
+    param_dtype:   any = jnp.bfloat16 if APPLY_DTYPE_POLICY else jnp.float32 # weights stored in bf16
+    compute_dtype: any = jnp.bfloat16 if APPLY_DTYPE_POLICY else jnp.float32   # activations in bf16
+    accum_dtype:   any = jnp.float32    # reductions (softmax, layernorm)
+
 
 class MLP(nnx.Module):
     def __init__(self, config: GPTConfig, rngs: nnx.Rngs):
         self.config = config
-        self.linear_1 = nnx.Linear(config.n_embd, 4 * config.n_embd, rngs=rngs)
-        self.linear_2 = nnx.Linear(4 * config.n_embd, config.n_embd, rngs=rngs)
+        self.linear_1 = nnx.Linear(config.n_embd, 4 * config.n_embd, rngs=rngs, dtype=config.compute_dtype)
+        self.linear_2 = nnx.Linear(4 * config.n_embd, config.n_embd, rngs=rngs, dtype=config.compute_dtype)
 
     def __call__(self, x: jnp.ndarray):
         return self.linear_2(nnx.gelu(self.linear_1(x)))
@@ -68,14 +76,15 @@ class Block(nnx.Module):
             qkv_features=config.n_embd,  # total dim; Flax splits by num_heads internally
             rngs=rngs,
             decode=False,
+            dtype=config.compute_dtype
         )
         self.mlp = MLP(config, rngs=rngs)
         self.layernorm_1 = nnx.LayerNorm(config.n_embd, rngs=rngs)
         self.layernorm_2 = nnx.LayerNorm(config.n_embd, rngs=rngs)
 
     def __call__(self, x: jnp.ndarray, mask: jnp.ndarray):
-        x = x + self.mha(self.layernorm_1(x), mask=mask)
-        x = x + self.mlp(self.layernorm_2(x))
+        x = x + self.mha(self.layernorm_1(x).astype(self.config.compute_dtype), mask=mask)
+        x = x + self.mlp(self.layernorm_2(x).astype(self.config.compute_dtype))
 
         return x
 
@@ -88,12 +97,14 @@ class GPT(nnx.Module):
             config.n_embd,
             rngs=rngs,
             embedding_init=nnx.initializers.normal(stddev=0.02),
+            dtype=config.compute_dtype
         )
         self.wpe = nnx.Embed(
             config.block_size,
             config.n_embd,
             rngs=rngs,
             embedding_init=nnx.initializers.normal(stddev=0.02),
+            dtype=config.compute_dtype
         )
         self.blocks = nnx.List(
             [Block(config, rngs=rngs) for _ in range(config.n_layer)]
@@ -115,10 +126,10 @@ class GPT(nnx.Module):
             return False
 
         def _apply(module, parent=None, _attr_name=None):
-            # Mixed precision: use bfloat16 for faster computation, weights remain float32, activations are bfloat16
-            # don't apply to LayerNorm as it sums many values, this can lead to overflow or underflow.
-            if isinstance(module, (nnx.Linear, nnx.MultiHeadAttention)):
-                module.dtype = jnp.bfloat16
+            # # Mixed precision: use bfloat16 for faster computation, weights remain float32, activations are bfloat16
+            # # don't apply to LayerNorm as it sums many values, this can lead to overflow or underflow.
+            # if isinstance(module, (nnx.Linear, nnx.MultiHeadAttention, nnx.Embed)):
+            #     module.dtype = jnp.bfloat16
 
             if isinstance(module, nnx.Linear):
                 stddev = (
@@ -127,13 +138,13 @@ class GPT(nnx.Module):
                     else 0.02 * residual_scale
                 )
                 module.kernel.value = nnx.initializers.normal(stddev=stddev)(
-                    rngs.params(), module.kernel.value.shape
+                    rngs.params(), module.kernel[...].shape
                 )
                 if module.use_bias:
-                    module.bias.value = jnp.zeros(module.bias.value.shape)
+                    module.bias.value = jnp.zeros(module.bias[...].shape)
             elif isinstance(module, nnx.Embed):
                 module.embedding.value = nnx.initializers.normal(stddev=0.02)(
-                    rngs.params(), module.embedding.value.shape
+                    rngs.params(), module.embedding[...].shape
                 )
             for attr_name, value in vars(module).items():
                 if isinstance(value, nnx.Module):
@@ -156,10 +167,11 @@ class GPT(nnx.Module):
         x = self.wte(x) + self.wpe(pos)  # (B, T, n_embd)
         for block in self.blocks:
             x = block(x, mask)
-        x = self.ln_f(x)
+        x = self.ln_f(x).astype(self.config.compute_dtype)
         # weight tying: reuse wte embedding matrix as output projection
-        logits = x @ self.wte.embedding.value.T  # (B, T, vocab_size)
-        return logits
+        logits = x @ self.wte.embedding[...].T  # (B, T, vocab_size)
+
+        return logits.astype(self.config.accum_dtype)
 
 
 class CharTokenizer:
@@ -216,6 +228,22 @@ class DataLoader:
         return len(self.tokens) // (self.sequence_length * self.batch_size)
 
 
+def cast_params(module: nnx.Module, dtype):
+    """Cast all float params in a module subtree to dtype."""
+    def cast(x):
+        if hasattr(x, 'dtype') and jnp.issubdtype(x.dtype, jnp.floating):
+            return x.astype(dtype)
+        return x
+
+    state = nnx.state(module)
+    new_state = jax.tree_util.tree_map(cast, state)
+    nnx.update(module, new_state)
+
+def apply_dtype_policy(model: nnx.Module, cfg):
+    for _, module in model.iter_modules():
+        if isinstance(module, (nnx.MultiHeadAttention, nnx.Linear, nnx.Embed)):
+            cast_params(module, cfg.param_dtype)
+
 # ── Training setup ──────────────────────────────────────────────────────────
 
 dataset = DataLoader(batch_size=BATCH_SIZE, sequence_length=SEQUENCE_LENGTH)
@@ -223,8 +251,22 @@ dataset = DataLoader(batch_size=BATCH_SIZE, sequence_length=SEQUENCE_LENGTH)
 config = GPTConfig()
 config.block_size = SEQUENCE_LENGTH
 config.vocab_size = dataset.vocab_size  # derived from the actual characters in the text
+
 rngs = nnx.Rngs(0)
 model = GPT(config, rngs=rngs)
+
+if APPLY_DTYPE_POLICY:
+    apply_dtype_policy(model, config)
+
+def dtype_report(model: nnx.Module):
+    for path, module in model.iter_modules():
+        for attr in ("kernel", "embedding", "scale", "bias"):
+            param = getattr(module, attr, None)
+            if param is not None and hasattr(param, "value"):
+                print(f"{path} {attr} {param[...].dtype}")
+
+dtype_report(model)
+
 
 learning_rate = 1e-3
 
@@ -244,6 +286,7 @@ def loss_fn(model: GPT, x: jnp.ndarray, y: jnp.ndarray):
 @nnx.jit
 def train_step(model: GPT, optimizer: nnx.Optimizer, x: jnp.ndarray, y: jnp.ndarray):
     loss, grads = nnx.value_and_grad(loss_fn)(model, x, y)
+
     optimizer.update(model, grads)
     return loss
 
@@ -254,7 +297,7 @@ max_steps = 50
 
 wandb.init(
     project="nano-gpt-jax",
-    mode=os.environ.get("WANDB_MODE", "offline"),
+    mode=os.environ.get("WANDB_MODE", "online"),
     config={
         "n_layer": config.n_layer,
         "n_head": config.n_head,
@@ -264,8 +307,8 @@ wandb.init(
         "batch_size": BATCH_SIZE,
         "sequence_length": SEQUENCE_LENGTH,
         "learning_rate": learning_rate,
-        "matmul_precision": MATMUL_PRECISION,
         "max_steps": max_steps,
+        "dtype_policy": APPLY_DTYPE_POLICY
     },
 )
 
