@@ -355,53 +355,95 @@ def train_step(model: GPT, optimizer: nnx.Optimizer, x: jnp.ndarray, y: jnp.ndar
     return loss
 
 
-# ── Training loop ────────────────────────────────────────────────────────────
-
-max_steps = 50
-
-wandb.init(
-    project="nano-gpt-jax",
-    mode=os.environ.get("WANDB_MODE", "online"),
-    config={
-        "n_layer": cfg.model.n_layer,
-        "n_head": cfg.model.n_head,
-        "n_embd": cfg.model.n_embd,
-        "block_size": cfg.model.block_size,
-        "vocab_size": cfg.model.vocab_size,
-        "batch_size": cfg.batch_size,
-        "sequence_length": cfg.sequence_length,
-        "learning_rate": learning_rate,
-        "max_steps": max_steps,
-        "dtype_policy": cfg.apply_dtype_policy,
-    },
-)
-
-
 def align_acc_step(step: int, gradient_acc_steps: int) -> int:
     return step // gradient_acc_steps
 
 
-for step, (x, y) in enumerate(dataset):
-    if step >= max_steps:
-        break
-    t0 = time.time()
-    loss = train_step(model, optimizer, x, y)
-    loss.block_until_ready()
-    dt = time.time() - t0
-    tokens_per_sec = dataset.sequence_length * dataset.batch_size / dt
+if __name__ == "__main__":
+    # ── Training setup ──────────────────────────────────────────────────────────
 
-    if step % cfg.grad_acc_steps == 0:
-        wandb.log(
-            {
-                "loss": loss.item(),
-                "step_time_ms": dt * 1000,
-                "tokens_per_sec": tokens_per_sec,
-                "learning_rate": schedule(optimizer.step[...]).item(),
-            },
-            step=align_acc_step(step, cfg.grad_acc_steps),
-        )
-        print(
-            f"step {align_acc_step(step, cfg.grad_acc_steps):4d} | loss {loss:.4f} | lr: {schedule(optimizer.step[...]):.4f} | time {dt * 1000:.2f} ms | tokens/sec {tokens_per_sec:.2f}"
-        )
+    dataset = DataLoader(batch_size=cfg.batch_size, sequence_length=cfg.sequence_length)
 
-wandb.finish()
+    cfg.model.vocab_size = (
+        dataset.vocab_size
+    )  # derived from the actual characters in the text
+
+    rngs = nnx.Rngs(0)
+    model = GPT(cfg.model, rngs=rngs)
+
+    if cfg.apply_dtype_policy:
+        apply_dtype_policy(model, cfg.model)
+
+    dtype_report(model)
+
+    learning_rate = 6e-4
+    warmup_steps = 10
+    decay_steps = 50 - warmup_steps
+
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=learning_rate,
+        warmup_steps=warmup_steps,
+        decay_steps=decay_steps,
+        end_value=learning_rate * 0.1,
+    )
+
+    tx = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(schedule, b1=0.9, b2=0.95, eps=1e-8, weight_decay=0.1),
+    )
+    if cfg.grad_acc_steps > 1:
+        tx = optax.MultiSteps(tx, every_k_schedule=cfg.grad_acc_steps)
+
+    optimizer = nnx.Optimizer(
+        model,
+        tx,
+        wrt=nnx.Param,
+    )
+
+    # ── Training loop ────────────────────────────────────────────────────────────
+
+    max_steps = 50
+
+    wandb.init(
+        project="nano-gpt-jax",
+        mode=os.environ.get("WANDB_MODE", "online"),
+        config={
+            "n_layer": cfg.model.n_layer,
+            "n_head": cfg.model.n_head,
+            "n_embd": cfg.model.n_embd,
+            "block_size": cfg.model.block_size,
+            "vocab_size": cfg.model.vocab_size,
+            "batch_size": cfg.batch_size,
+            "sequence_length": cfg.sequence_length,
+            "learning_rate": learning_rate,
+            "max_steps": max_steps,
+            "dtype_policy": cfg.apply_dtype_policy,
+        },
+    )
+
+    for step, (x, y) in enumerate(dataset):
+        if step >= max_steps:
+            break
+        t0 = time.time()
+        loss = train_step(model, optimizer, x, y)
+        loss.block_until_ready()
+        dt = time.time() - t0
+        tokens_per_sec = dataset.sequence_length * dataset.batch_size / dt
+
+        if step % cfg.grad_acc_steps == 0:
+            wandb.log(
+                {
+                    "loss": loss.item(),
+                    "step_time_ms": dt * 1000,
+                    "tokens_per_sec": tokens_per_sec,
+                    "learning_rate": schedule(optimizer.step[...]).item(),
+                },
+                step=align_acc_step(step, cfg.grad_acc_steps),
+            )
+            print(
+                f"step {align_acc_step(step, cfg.grad_acc_steps):4d} | loss {loss:.4f} | lr: {schedule(optimizer.step[...]):.4f} | time {dt * 1000:.2f} ms | tokens/sec {tokens_per_sec:.2f}"
+            )
+
+    wandb.finish()
+
