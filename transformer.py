@@ -1,5 +1,3 @@
-from pydantic._internal import _generate_schema
-from IPython.core import interactiveshell
 import os
 import time
 import tiktoken
@@ -57,17 +55,19 @@ def get_config() -> ConfigDict:
     cfg.sequence_length = 1024
     cfg.apply_dtype_policy = True
     cfg.num_devices = jax.device_count()
-    cfg.device_batch_size = 16
+    cfg.device_batch_size = 32
     cfg.batch_size = cfg.device_batch_size * cfg.num_devices
     cfg.gpt_batch_size = 524288
-    cfg.grad_acc_steps = cfg.gpt_batch_size // cfg.batch_size
+    cfg.grad_acc_steps = cfg.gpt_batch_size // (cfg.batch_size * cfg.sequence_length)
     cfg.dataset = "edu_fineweb"  # "input_txt" or "edu_fineweb"
-    cfg.val_check_steps = 250  # evaluate validation loss every 250 steps
+    cfg.val_check_steps = 100  # evaluate validation loss every 100 steps
+    cfg.val_max_steps = 50  # max number of batches to use for validation
+    cfg.max_steps = 10_000  # total training steps
 
     # GPT model config
     cfg.model = ConfigDict()
     cfg.model.block_size = cfg.sequence_length
-    cfg.model.vocab_size = 65
+    cfg.model.vocab_size = -1
     cfg.model.n_layer = 6
     cfg.model.n_head = 6
     cfg.model.n_embd = 384
@@ -85,12 +85,18 @@ def get_cpu_test_config() -> ConfigDict:
     cfg.gpt_batch_size = 16
     cfg.grad_acc_steps = 1
     cfg.val_check_steps = 10  # evaluate validation loss every 10 steps
+    cfg.val_max_steps = 100  # max number of batches to use for validation
+    cfg.max_steps = 50  # total training steps
     # cfg.dataset = "input_txt"
 
     return cfg
 
 
-cfg = get_cpu_test_config()
+_accelerator_backends = {"gpu", "tpu"}
+_has_accelerator = any(
+    d.platform in _accelerator_backends for d in jax.devices()
+)
+cfg = get_config() if _has_accelerator else get_cpu_test_config()
 
 
 class MLP(nnx.Module):
@@ -363,57 +369,12 @@ def apply_dtype_policy(model: nnx.Module, cfg):
             cast_params(module, cfg.param_dtype)
 
 
-# ── Training setup ──────────────────────────────────────────────────────────
-
-dataset = DataLoader(batch_size=cfg.batch_size, sequence_length=cfg.sequence_length)
-
-cfg.model.vocab_size = (
-    dataset.vocab_size
-)  # derived from the actual characters in the text
-
-rngs = nnx.Rngs(0)
-model = GPT(cfg.model, rngs=rngs)
-
-if cfg.apply_dtype_policy:
-    apply_dtype_policy(model, cfg.model)
-
-
 def dtype_report(model: nnx.Module):
     for path, module in model.iter_modules():
         for attr in ("kernel", "embedding", "scale", "bias"):
             param = getattr(module, attr, None)
             if param is not None and hasattr(param, "value"):
                 print(f"{path} {attr} {param[...].dtype}")
-
-
-dtype_report(model)
-
-
-learning_rate = 6e-4
-warmup_steps = 10
-decay_steps = 50 - warmup_steps
-
-schedule = optax.warmup_cosine_decay_schedule(
-    init_value=0.0,
-    peak_value=learning_rate,
-    warmup_steps=warmup_steps,
-    decay_steps=decay_steps,
-    end_value=learning_rate * 0.1,
-)
-
-
-tx = optax.chain(
-    optax.clip_by_global_norm(1.0),
-    optax.adamw(schedule, b1=0.9, b2=0.95, eps=1e-8, weight_decay=0.1),
-)
-if cfg.grad_acc_steps > 1:
-    tx = optax.MultiSteps(tx, every_k_schedule=cfg.grad_acc_steps)
-
-optimizer = nnx.Optimizer(
-    model,
-    tx,
-    wrt=nnx.Param,
-)
 
 
 def loss_fn(model: GPT, x: jnp.ndarray, y: jnp.ndarray):
@@ -478,7 +439,7 @@ if __name__ == "__main__":
 
     learning_rate = 6e-4
     warmup_steps = 10
-    decay_steps = 50 - warmup_steps
+    decay_steps = cfg.max_steps - warmup_steps
 
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
@@ -503,7 +464,7 @@ if __name__ == "__main__":
 
     # ── Training loop ────────────────────────────────────────────────────────────
 
-    max_steps = 50
+    max_steps = cfg.max_steps
 
     wandb.init(
         project="nano-gpt-jax",
@@ -522,6 +483,8 @@ if __name__ == "__main__":
         },
     )
 
+
+    t0 = time.time()
     for step, (x, y) in enumerate(dataset):
         if step >= max_steps:
             break
@@ -533,20 +496,19 @@ if __name__ == "__main__":
         ):
             t_val_start = time.time()
             val_loss_accum = 0.0
-            val_steps = len(val_dataset)
+            val_steps = min(cfg.val_max_steps, len(val_dataset))
             val_iter = iter(val_dataset)
-            import tqdm
 
-            for _ in tqdm.tqdm(range(val_steps)):
+            for _ in range(val_steps):
                 x_val, y_val = next(val_iter)
                 v_loss = val_step(model, x_val, y_val)
                 val_loss_accum += v_loss.item()
             t_val_end = time.time()
             val_dt = t_val_end - t_val_start
-            
+
             total_val_tokens = val_steps * val_dataset.sequence_length * val_dataset.batch_size
             val_tokens_per_sec = total_val_tokens / val_dt
-            
+
             val_loss = val_loss_accum / val_steps
             print(
                 f"step {align_acc_step(step, cfg.grad_acc_steps):4d} | validation loss {val_loss:.4f} | val_time {val_dt * 1000:.2f} ms | val_tokens/sec {val_tokens_per_sec:.2f}"
@@ -559,12 +521,13 @@ if __name__ == "__main__":
                 },
                 step=align_acc_step(step, cfg.grad_acc_steps),
             )
+            # Reset timer so validation time doesn't pollute training throughput
+            t0 = time.time()
 
-        t0 = time.time()
         loss = train_step(model, optimizer, x, y)
-        loss.block_until_ready()
+        loss.block_until_ready()  # Ensure GPU work is done before measuring time
         dt = time.time() - t0
-        tokens_per_sec = dataset.sequence_length * dataset.batch_size / dt
+        tokens_per_sec = dataset.sequence_length * dataset.batch_size * cfg.grad_acc_steps / dt
 
         if step % cfg.grad_acc_steps == 0:
             wandb.log(
@@ -579,5 +542,6 @@ if __name__ == "__main__":
             print(
                 f"step {align_acc_step(step, cfg.grad_acc_steps):4d} | loss {loss:.4f} | lr: {schedule(optimizer.step[...]):.4f} | time {dt * 1000:.2f} ms | tokens/sec {tokens_per_sec:.2f}"
             )
+            t0 = time.time()
 
     wandb.finish()
