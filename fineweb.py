@@ -42,7 +42,7 @@ shard_size = int(1e8)  # 100M tokens per shard, total of 100 shards
 
 val_shards = 2 if args.smoke_test else 1
 if args.smoke_test:
-    shard_size = 1024 * 16 * 256  # tiny shard
+    shard_size = 1024 * 16 + 1  # tiny shard (B * T + 1) to accommodate target shift
     total_shards = 4  # 2 val + 2 train
 else:
     total_shards = args.num_shards
@@ -53,7 +53,9 @@ os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 
 # in smoke-test mode, clean old files in DATA_CACHE_DIR to avoid stale shards
 if args.smoke_test:
-    print(f"=== SMOKE TEST MODE: generating {val_shards} val and {total_shards - val_shards} train shards ===")
+    print(
+        f"=== SMOKE TEST MODE: generating {val_shards} val and {total_shards - val_shards} train shards ==="
+    )
     for f in os.listdir(DATA_CACHE_DIR):
         if f.startswith("edufineweb_") and f.endswith(".npy"):
             os.remove(os.path.join(DATA_CACHE_DIR, f))
@@ -117,9 +119,7 @@ if __name__ == "__main__":
                     progress_bar.close()
 
                     if total_shards is not None and shard_index >= total_shards:
-                        print(
-                            f"Reached limit of {total_shards} shards, stopping."
-                        )
+                        print(f"Reached limit of {total_shards} shards, stopping.")
                         return
 
                     progress_bar = tqdm(

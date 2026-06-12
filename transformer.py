@@ -62,6 +62,7 @@ def get_config() -> ConfigDict:
     cfg.gpt_batch_size = 524288
     cfg.grad_acc_steps = cfg.gpt_batch_size // cfg.batch_size
     cfg.dataset = "edu_fineweb"  # "input_txt" or "edu_fineweb"
+    cfg.val_check_steps = 250  # evaluate validation loss every 250 steps
 
     # GPT model config
     cfg.model = ConfigDict()
@@ -83,6 +84,7 @@ def get_cpu_test_config() -> ConfigDict:
     cfg.batch_size = 16
     cfg.gpt_batch_size = 16
     cfg.grad_acc_steps = 1
+    cfg.val_check_steps = 10  # evaluate validation loss every 10 steps
     # cfg.dataset = "input_txt"
 
     return cfg
@@ -432,6 +434,12 @@ def train_step(model: GPT, optimizer: nnx.Optimizer, x: jnp.ndarray, y: jnp.ndar
     return loss
 
 
+@nnx.jit
+def val_step(model: GPT, x: jnp.ndarray, y: jnp.ndarray):
+    loss = loss_fn(model, x, y)
+    return loss
+
+
 def align_acc_step(step: int, gradient_acc_steps: int) -> int:
     return step // gradient_acc_steps
 
@@ -445,10 +453,16 @@ if __name__ == "__main__":
             sequence_length=cfg.sequence_length,
             split="train",
         )
+        val_dataset = EduFinewebDataLoader(
+            batch_size=cfg.batch_size,
+            sequence_length=cfg.sequence_length,
+            split="val",
+        )
     else:
         dataset = DataLoader(
             batch_size=cfg.batch_size, sequence_length=cfg.sequence_length
         )
+        val_dataset = None
 
     cfg.model.vocab_size = (
         dataset.vocab_size
@@ -511,6 +525,41 @@ if __name__ == "__main__":
     for step, (x, y) in enumerate(dataset):
         if step >= max_steps:
             break
+
+        # Validation evaluation
+        if (
+            val_dataset is not None
+            and step % (cfg.val_check_steps * cfg.grad_acc_steps) == 0
+        ):
+            t_val_start = time.time()
+            val_loss_accum = 0.0
+            val_steps = len(val_dataset)
+            val_iter = iter(val_dataset)
+            import tqdm
+
+            for _ in tqdm.tqdm(range(val_steps)):
+                x_val, y_val = next(val_iter)
+                v_loss = val_step(model, x_val, y_val)
+                val_loss_accum += v_loss.item()
+            t_val_end = time.time()
+            val_dt = t_val_end - t_val_start
+            
+            total_val_tokens = val_steps * val_dataset.sequence_length * val_dataset.batch_size
+            val_tokens_per_sec = total_val_tokens / val_dt
+            
+            val_loss = val_loss_accum / val_steps
+            print(
+                f"step {align_acc_step(step, cfg.grad_acc_steps):4d} | validation loss {val_loss:.4f} | val_time {val_dt * 1000:.2f} ms | val_tokens/sec {val_tokens_per_sec:.2f}"
+            )
+            wandb.log(
+                {
+                    "val_loss": val_loss,
+                    "val_time_ms": val_dt * 1000,
+                    "val_tokens_per_sec": val_tokens_per_sec,
+                },
+                step=align_acc_step(step, cfg.grad_acc_steps),
+            )
+
         t0 = time.time()
         loss = train_step(model, optimizer, x, y)
         loss.block_until_ready()
