@@ -6,3 +6,4 @@ checkpoints/
 wandb/
 .DS_Store
 .env
+edu_fineweb10B/*.npy

@@ -1,3 +1,5 @@
+from pydantic._internal import _generate_schema
+from IPython.core import interactiveshell
 import os
 import time
 import tiktoken
@@ -7,7 +9,7 @@ import optax
 from functools import partial
 from flax import nnx
 from typing import Callable
-
+from ml_collections import ConfigDict
 
 
 print("jax.device_count():", jax.device_count())
@@ -23,52 +25,85 @@ if os.path.exists(".env"):
                 os.environ[key.strip()] = val.strip()
 
 if os.environ.get("WANDB_MODE") == "disabled":
+
     class MockWandb:
         @staticmethod
         def init(*args, **kwargs):
             class Run:
-                def log(self, *args, **kwargs): pass
-                def finish(self, *args, **kwargs): pass
+                def log(self, *args, **kwargs):
+                    pass
+
+                def finish(self, *args, **kwargs):
+                    pass
+
             return Run()
+
         @staticmethod
-        def log(*args, **kwargs): pass
+        def log(*args, **kwargs):
+            pass
+
         @staticmethod
-        def finish(*args, **kwargs): pass
+        def finish(*args, **kwargs):
+            pass
+
     wandb = MockWandb()
 else:
     import wandb
 
 
-SEQUENCE_LENGTH = 1024
-BATCH_SIZE = 16
-APPLY_DTYPE_POLICY = True
+def get_config() -> ConfigDict:
+    cfg = ConfigDict()
+    cfg.sequence_length = 1024
+    cfg.apply_dtype_policy = True
+    cfg.num_devices = jax.device_count()
+    cfg.device_batch_size = 16
+    cfg.batch_size = cfg.device_batch_size * cfg.num_devices
+    cfg.gpt_batch_size = 524288
+    cfg.grad_acc_steps = cfg.gpt_batch_size // cfg.batch_size
+
+    # GPT model config
+    cfg.model = ConfigDict()
+    cfg.model.block_size = cfg.sequence_length
+    cfg.model.vocab_size = 65
+    cfg.model.n_layer = 6
+    cfg.model.n_head = 6
+    cfg.model.n_embd = 384
+    cfg.model.param_dtype = jnp.bfloat16 if cfg.apply_dtype_policy else jnp.float32
+    cfg.model.compute_dtype = jnp.bfloat16 if cfg.apply_dtype_policy else jnp.float32
+    cfg.model.accum_dtype = jnp.float32
+    return cfg
 
 
-class GPTConfig:
-    block_size: int = 32
-    vocab_size: int = 65
-    n_layer: int = 6
-    n_head: int = 6
-    n_embd: int = 384
+def get_cpu_test_config() -> ConfigDict:
+    """Lightweight config for quick testing on CPU."""
+    cfg = get_config()
+    cfg.apply_dtype_policy = False
+    cfg.batch_size = 16
+    cfg.gpt_batch_size = 16
+    cfg.grad_acc_steps = 1
 
-    # dtype policy
-    param_dtype:   any = jnp.bfloat16 if APPLY_DTYPE_POLICY else jnp.float32 # weights stored in bf16
-    compute_dtype: any = jnp.bfloat16 if APPLY_DTYPE_POLICY else jnp.float32   # activations in bf16
-    accum_dtype:   any = jnp.float32    # reductions (softmax, layernorm)
+    return cfg
+
+
+cfg = get_cpu_test_config()
 
 
 class MLP(nnx.Module):
-    def __init__(self, config: GPTConfig, rngs: nnx.Rngs):
+    def __init__(self, config: ConfigDict, rngs: nnx.Rngs):
         self.config = config
-        self.linear_1 = nnx.Linear(config.n_embd, 4 * config.n_embd, rngs=rngs, dtype=config.compute_dtype)
-        self.linear_2 = nnx.Linear(4 * config.n_embd, config.n_embd, rngs=rngs, dtype=config.compute_dtype)
+        self.linear_1 = nnx.Linear(
+            config.n_embd, 4 * config.n_embd, rngs=rngs, dtype=config.compute_dtype
+        )
+        self.linear_2 = nnx.Linear(
+            4 * config.n_embd, config.n_embd, rngs=rngs, dtype=config.compute_dtype
+        )
 
     def __call__(self, x: jnp.ndarray):
         return self.linear_2(nnx.gelu(self.linear_1(x)))
 
 
 class Block(nnx.Module):
-    def __init__(self, config: GPTConfig, rngs: nnx.Rngs):
+    def __init__(self, config: ConfigDict, rngs: nnx.Rngs):
         self.config = config
         self.mha = nnx.MultiHeadAttention(
             num_heads=config.n_head,
@@ -76,35 +111,37 @@ class Block(nnx.Module):
             qkv_features=config.n_embd,  # total dim; Flax splits by num_heads internally
             rngs=rngs,
             decode=False,
-            dtype=config.compute_dtype
+            dtype=config.compute_dtype,
         )
         self.mlp = MLP(config, rngs=rngs)
         self.layernorm_1 = nnx.LayerNorm(config.n_embd, rngs=rngs)
         self.layernorm_2 = nnx.LayerNorm(config.n_embd, rngs=rngs)
 
     def __call__(self, x: jnp.ndarray, mask: jnp.ndarray):
-        x = x + self.mha(self.layernorm_1(x).astype(self.config.compute_dtype), mask=mask)
+        x = x + self.mha(
+            self.layernorm_1(x).astype(self.config.compute_dtype), mask=mask
+        )
         x = x + self.mlp(self.layernorm_2(x).astype(self.config.compute_dtype))
 
         return x
 
 
 class GPT(nnx.Module):
-    def __init__(self, config: GPTConfig, rngs: nnx.Rngs):
+    def __init__(self, config: ConfigDict, rngs: nnx.Rngs):
         self.config = config
         self.wte = nnx.Embed(
             config.vocab_size,
             config.n_embd,
             rngs=rngs,
             embedding_init=nnx.initializers.normal(stddev=0.02),
-            dtype=config.compute_dtype
+            dtype=config.compute_dtype,
         )
         self.wpe = nnx.Embed(
             config.block_size,
             config.n_embd,
             rngs=rngs,
             embedding_init=nnx.initializers.normal(stddev=0.02),
-            dtype=config.compute_dtype
+            dtype=config.compute_dtype,
         )
         self.blocks = nnx.List(
             [Block(config, rngs=rngs) for _ in range(config.n_layer)]
@@ -230,8 +267,9 @@ class DataLoader:
 
 def cast_params(module: nnx.Module, dtype):
     """Cast all float params in a module subtree to dtype."""
+
     def cast(x):
-        if hasattr(x, 'dtype') and jnp.issubdtype(x.dtype, jnp.floating):
+        if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating):
             return x.astype(dtype)
         return x
 
@@ -239,24 +277,27 @@ def cast_params(module: nnx.Module, dtype):
     new_state = jax.tree_util.tree_map(cast, state)
     nnx.update(module, new_state)
 
+
 def apply_dtype_policy(model: nnx.Module, cfg):
     for _, module in model.iter_modules():
         if isinstance(module, (nnx.MultiHeadAttention, nnx.Linear, nnx.Embed)):
             cast_params(module, cfg.param_dtype)
 
+
 # ── Training setup ──────────────────────────────────────────────────────────
 
-dataset = DataLoader(batch_size=BATCH_SIZE, sequence_length=SEQUENCE_LENGTH)
+dataset = DataLoader(batch_size=cfg.batch_size, sequence_length=cfg.sequence_length)
 
-config = GPTConfig()
-config.block_size = SEQUENCE_LENGTH
-config.vocab_size = dataset.vocab_size  # derived from the actual characters in the text
+cfg.model.vocab_size = (
+    dataset.vocab_size
+)  # derived from the actual characters in the text
 
 rngs = nnx.Rngs(0)
-model = GPT(config, rngs=rngs)
+model = GPT(cfg.model, rngs=rngs)
 
-if APPLY_DTYPE_POLICY:
-    apply_dtype_policy(model, config)
+if cfg.apply_dtype_policy:
+    apply_dtype_policy(model, cfg.model)
+
 
 def dtype_report(model: nnx.Module):
     for path, module in model.iter_modules():
@@ -264,6 +305,7 @@ def dtype_report(model: nnx.Module):
             param = getattr(module, attr, None)
             if param is not None and hasattr(param, "value"):
                 print(f"{path} {attr} {param[...].dtype}")
+
 
 dtype_report(model)
 
@@ -273,21 +315,25 @@ warmup_steps = 10
 decay_steps = 50 - warmup_steps
 
 schedule = optax.warmup_cosine_decay_schedule(
-    init_value=0.0,      
+    init_value=0.0,
     peak_value=learning_rate,
-    warmup_steps=warmup_steps, 
-    decay_steps=decay_steps,  
-    end_value = learning_rate * 0.1, 
+    warmup_steps=warmup_steps,
+    decay_steps=decay_steps,
+    end_value=learning_rate * 0.1,
 )
 
 
+tx = optax.chain(
+    optax.clip_by_global_norm(1.0),
+    optax.adamw(schedule, b1=0.9, b2=0.95, eps=1e-8, weight_decay=0.1),
+)
+if cfg.grad_acc_steps > 1:
+    tx = optax.MultiSteps(tx, every_k_schedule=cfg.grad_acc_steps)
+
 optimizer = nnx.Optimizer(
-    model, 
-    optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adamw(schedule, b1=0.9, b2=0.95, eps=1e-8, weight_decay=0.1)
-    ), 
-    wrt=nnx.Param
+    model,
+    tx,
+    wrt=nnx.Param,
 )
 
 
@@ -317,18 +363,23 @@ wandb.init(
     project="nano-gpt-jax",
     mode=os.environ.get("WANDB_MODE", "online"),
     config={
-        "n_layer": config.n_layer,
-        "n_head": config.n_head,
-        "n_embd": config.n_embd,
-        "block_size": config.block_size,
-        "vocab_size": config.vocab_size,
-        "batch_size": BATCH_SIZE,
-        "sequence_length": SEQUENCE_LENGTH,
+        "n_layer": cfg.model.n_layer,
+        "n_head": cfg.model.n_head,
+        "n_embd": cfg.model.n_embd,
+        "block_size": cfg.model.block_size,
+        "vocab_size": cfg.model.vocab_size,
+        "batch_size": cfg.batch_size,
+        "sequence_length": cfg.sequence_length,
         "learning_rate": learning_rate,
         "max_steps": max_steps,
-        "dtype_policy": APPLY_DTYPE_POLICY
+        "dtype_policy": cfg.apply_dtype_policy,
     },
 )
+
+
+def align_acc_step(step: int, gradient_acc_steps: int) -> int:
+    return step // gradient_acc_steps
+
 
 for step, (x, y) in enumerate(dataset):
     if step >= max_steps:
@@ -338,17 +389,19 @@ for step, (x, y) in enumerate(dataset):
     loss.block_until_ready()
     dt = time.time() - t0
     tokens_per_sec = dataset.sequence_length * dataset.batch_size / dt
-    wandb.log(
-        {
-            "loss": loss.item(),
-            "step_time_ms": dt * 1000,
-            "tokens_per_sec": tokens_per_sec,
-            "learning_rate": schedule(optimizer.step[...]).item(),
-        },
-        step=step,
-    )
-    print(
-        f"step {step:4d} | loss {loss:.4f} | lr: {schedule(optimizer.step[...]):.4f} | time {dt * 1000:.2f} ms | tokens/sec {tokens_per_sec:.2f}"
-    )
+
+    if step % cfg.grad_acc_steps == 0:
+        wandb.log(
+            {
+                "loss": loss.item(),
+                "step_time_ms": dt * 1000,
+                "tokens_per_sec": tokens_per_sec,
+                "learning_rate": schedule(optimizer.step[...]).item(),
+            },
+            step=align_acc_step(step, cfg.grad_acc_steps),
+        )
+        print(
+            f"step {align_acc_step(step, cfg.grad_acc_steps):4d} | loss {loss:.4f} | lr: {schedule(optimizer.step[...]):.4f} | time {dt * 1000:.2f} ms | tokens/sec {tokens_per_sec:.2f}"
+        )
 
 wandb.finish()
