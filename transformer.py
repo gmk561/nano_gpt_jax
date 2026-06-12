@@ -3,6 +3,7 @@ from IPython.core import interactiveshell
 import os
 import time
 import tiktoken
+import numpy as np
 import jax
 import jax.numpy as jnp
 import optax
@@ -60,6 +61,7 @@ def get_config() -> ConfigDict:
     cfg.batch_size = cfg.device_batch_size * cfg.num_devices
     cfg.gpt_batch_size = 524288
     cfg.grad_acc_steps = cfg.gpt_batch_size // cfg.batch_size
+    cfg.dataset = "edu_fineweb"  # "input_txt" or "edu_fineweb"
 
     # GPT model config
     cfg.model = ConfigDict()
@@ -81,6 +83,7 @@ def get_cpu_test_config() -> ConfigDict:
     cfg.batch_size = 16
     cfg.gpt_batch_size = 16
     cfg.grad_acc_steps = 1
+    # cfg.dataset = "input_txt"
 
     return cfg
 
@@ -265,6 +268,80 @@ class DataLoader:
         return len(self.tokens) // (self.sequence_length * self.batch_size)
 
 
+class EduFinewebDataLoader:
+    """Streams pre-tokenized .npy shards produced by fineweb.py.
+
+    Shards live in ``data_dir`` with names like
+    ``edufineweb_train_000001.npy`` / ``edufineweb_val_000000.npy``.
+
+    The loader cycles through all shards for the given *split*, advancing
+    the internal pointer exactly like the simple DataLoader above.
+    """
+
+    DATA_DIR = os.path.join(os.path.dirname(__file__), "edu_fineweb10B")
+
+    def __init__(self, batch_size: int, sequence_length: int, split: str = "train"):
+        self.batch_size = batch_size
+        self.sequence_length = sequence_length
+        self.split = split
+
+        # GPT-2 vocab size (fixed for this tokenizer)
+        self.vocab_size = tiktoken.get_encoding("gpt2").n_vocab
+
+        # Discover shard files for this split, sorted by index
+        self.shard_paths = sorted(
+            [
+                os.path.join(self.DATA_DIR, f)
+                for f in os.listdir(self.DATA_DIR)
+                if f.startswith(f"edufineweb_{split}_") and f.endswith(".npy")
+            ]
+        )
+        if not self.shard_paths:
+            raise FileNotFoundError(
+                f"No .npy shards found for split='{split}' in {self.DATA_DIR}. "
+                f"Run `python fineweb.py` first."
+            )
+
+        self.shard_idx = 0
+        self.idx = 0
+        self._load_shard(0)
+
+    def _load_shard(self, shard_idx: int) -> None:
+        """Load a single shard into memory as a jnp int32 array."""
+        self.shard_idx = shard_idx % len(self.shard_paths)
+        self.tokens = jnp.array(
+            np.load(self.shard_paths[self.shard_idx]).astype(np.int32)
+        )
+        self.idx = 0
+
+    def __next__(self):
+        B, T = self.batch_size, self.sequence_length
+        needed = B * T + 1  # +1 for the target shift
+
+        # If the current shard is exhausted, advance to the next one
+        if self.idx + needed > len(self.tokens):
+            self.shard_idx += 1
+            self._load_shard(self.shard_idx)
+
+        buf = self.tokens[self.idx : self.idx + needed]
+        x = buf[:-1].reshape(B, T)
+        y = buf[1:].reshape(B, T)
+        self.idx += B * T
+        return x, y
+
+    def __iter__(self):
+        self._load_shard(0)
+        return self
+
+    def __len__(self):
+        """Approximate total steps across all shards (each shard counted once)."""
+        total_tokens = sum(
+            os.path.getsize(p) // 2  # uint16 → 2 bytes per token
+            for p in self.shard_paths
+        )
+        return total_tokens // (self.sequence_length * self.batch_size)
+
+
 def cast_params(module: nnx.Module, dtype):
     """Cast all float params in a module subtree to dtype."""
 
@@ -362,7 +439,16 @@ def align_acc_step(step: int, gradient_acc_steps: int) -> int:
 if __name__ == "__main__":
     # ── Training setup ──────────────────────────────────────────────────────────
 
-    dataset = DataLoader(batch_size=cfg.batch_size, sequence_length=cfg.sequence_length)
+    if cfg.dataset == "edu_fineweb":
+        dataset = EduFinewebDataLoader(
+            batch_size=cfg.batch_size,
+            sequence_length=cfg.sequence_length,
+            split="train",
+        )
+    else:
+        dataset = DataLoader(
+            batch_size=cfg.batch_size, sequence_length=cfg.sequence_length
+        )
 
     cfg.model.vocab_size = (
         dataset.vocab_size
@@ -446,4 +532,3 @@ if __name__ == "__main__":
             )
 
     wandb.finish()
-

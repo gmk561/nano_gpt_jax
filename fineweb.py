@@ -40,20 +40,28 @@ local_dir = "edu_fineweb10B"
 remote_name = "sample-10BT"
 shard_size = int(1e8)  # 100M tokens per shard, total of 100 shards
 
+val_shards = 2 if args.smoke_test else 1
 if args.smoke_test:
-    shard_size = int(1e5)  # tiny shard for smoke test
+    shard_size = 1024 * 16 * 256  # tiny shard
+    total_shards = 4  # 2 val + 2 train
+else:
+    total_shards = args.num_shards
 
 # create the cache the local directory if it doesn't exist yet
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
 os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 
-# download the dataset
-fw = load_dataset("HuggingFaceFW/fineweb-edu", name=remote_name, split="train", streaming=True)
-
-# in smoke-test mode, take only 20 documents
+# in smoke-test mode, clean old files in DATA_CACHE_DIR to avoid stale shards
 if args.smoke_test:
-    print("=== SMOKE TEST MODE: processing 20 documents only ===")
-    fw = fw.take(20)
+    print(f"=== SMOKE TEST MODE: generating {val_shards} val and {total_shards - val_shards} train shards ===")
+    for f in os.listdir(DATA_CACHE_DIR):
+        if f.startswith("edufineweb_") and f.endswith(".npy"):
+            os.remove(os.path.join(DATA_CACHE_DIR, f))
+
+# download the dataset
+fw = load_dataset(
+    "HuggingFaceFW/fineweb-edu", name=remote_name, split="train", streaming=True
+)
 
 # init the tokenizer
 enc = tiktoken.get_encoding("gpt2")
@@ -84,42 +92,49 @@ if __name__ == "__main__":
         shard_index = 0
         all_tokens_np = np.empty((shard_size,), dtype=np.uint16)
         token_count = 0
-        progress_bar = None
+        progress_bar = tqdm(
+            total=shard_size, unit="tokens", desc=f"Shard {shard_index}"
+        )
         for tokens in token_iterator:
-            # is there enough space in the current shard for the new tokens?
-            if token_count + len(tokens) < shard_size:
-                all_tokens_np[token_count : token_count + len(tokens)] = tokens
-                token_count += len(tokens)
-                if progress_bar is None:
+            offset = 0
+            while offset < len(tokens):
+                space_left = shard_size - token_count
+                chunk_size = min(space_left, len(tokens) - offset)
+                all_tokens_np[token_count : token_count + chunk_size] = tokens[
+                    offset : offset + chunk_size
+                ]
+                token_count += chunk_size
+                offset += chunk_size
+                progress_bar.update(chunk_size)
+
+                if token_count == shard_size:
+                    split = "val" if shard_index < val_shards else "train"
+                    filename = os.path.join(
+                        DATA_CACHE_DIR, f"edufineweb_{split}_{shard_index:06d}"
+                    )
+                    write_datafile(filename, all_tokens_np)
+                    shard_index += 1
+                    progress_bar.close()
+
+                    if total_shards is not None and shard_index >= total_shards:
+                        print(
+                            f"Reached limit of {total_shards} shards, stopping."
+                        )
+                        return
+
                     progress_bar = tqdm(
                         total=shard_size, unit="tokens", desc=f"Shard {shard_index}"
                     )
-                progress_bar.update(len(tokens))
-            else:
-                split = "val" if shard_index == 0 else "train"
-                filename = os.path.join(
-                    DATA_CACHE_DIR, f"edufineweb_{split}_{shard_index:06d}"
-                )
-                remainder = shard_size - token_count
-                progress_bar.update(remainder)
-                all_tokens_np[token_count : token_count + remainder] = tokens[:remainder]
-                write_datafile(filename, all_tokens_np)
-                shard_index += 1
-                progress_bar = None
-
-                # stop early if --num-shards limit reached
-                if args.num_shards is not None and shard_index >= args.num_shards:
-                    print(f"Reached --num-shards={args.num_shards} limit, stopping.")
-                    return
-
-                all_tokens_np[0 : len(tokens) - remainder] = tokens[remainder:]
-                token_count = len(tokens) - remainder
+                    token_count = 0
 
         # write any remaining tokens as the last shard
         if token_count != 0:
-            split = "val" if shard_index == 0 else "train"
-            filename = os.path.join(DATA_CACHE_DIR, f"edufineweb_{split}_{shard_index:06d}")
+            split = "val" if shard_index < val_shards else "train"
+            filename = os.path.join(
+                DATA_CACHE_DIR, f"edufineweb_{split}_{shard_index:06d}"
+            )
             write_datafile(filename, all_tokens_np[:token_count])
+        progress_bar.close()
 
     if args.smoke_test:
         # smoke-test: no multiprocessing at all — plain sequential loop, no SIGSEGV
@@ -128,4 +143,3 @@ if __name__ == "__main__":
         # full mode: parallel tokenization with a process pool
         with mp.Pool(nprocs) as pool:
             process(pool.imap(tokenize, fw, chunksize=16))
-
