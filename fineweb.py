@@ -89,6 +89,7 @@ def write_datafile(filename, tokens_np):
 if __name__ == "__main__":
     # tokenize all documents and write output shards, each of shard_size tokens (last shard has remainder)
     nprocs = max(1, os.cpu_count() // 2)
+    print(f"Number of processes used {nprocs}")
 
     def process(token_iterator):
         shard_index = 0

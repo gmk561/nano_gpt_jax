@@ -1,5 +1,9 @@
-jax>=0.7.1
-flax>=0.12.0
-optax>=0.2.5
-tiktoken>=0.13.0
-wandb>=0.27.2
+jax
+flax
+optax
+tiktoken
+wandb
+ml-collections
+datasets
+tqdm
+requests
