@@ -1,3 +1,5 @@
+numpy<2
+jax[cuda12]
 flax
 optax
 tiktoken
