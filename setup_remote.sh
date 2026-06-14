@@ -47,10 +47,17 @@ cd "$REPO_DIR"
 # 5. Install Dependencies (preserving remote machine's JAX)
 echo "Setting up Python environment..."
 
-PYTHON_CMD="python"
-PIP_CMD="pip"
+# Create virtual environment with system site packages to inherit pre-installed JAX
+VENV_DIR="$REPO_DIR/.venv"
+if [ ! -d "$VENV_DIR" ]; then
+    echo "Creating virtual environment at $VENV_DIR (with --system-site-packages)..."
+    sudo -u "$TARGET_USER" python -m venv --system-site-packages "$VENV_DIR"
+fi
 
-# Check JAX version
+PYTHON_CMD="$VENV_DIR/bin/python"
+PIP_CMD="$VENV_DIR/bin/pip"
+
+# Check JAX version via virtual environment
 JAX_VERSION=$(sudo -u "$TARGET_USER" $PYTHON_CMD -c "import jax; print(jax.__version__)" 2>/dev/null || true)
 JAXLIB_VERSION=$(sudo -u "$TARGET_USER" $PYTHON_CMD -c "import jaxlib; print(jaxlib.__version__)" 2>/dev/null || true)
 

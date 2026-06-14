@@ -103,6 +103,7 @@ def get_cpu_test_config() -> ConfigDict:
 
 _accelerator_backends = {"gpu", "tpu"}
 _has_accelerator = any(d.platform in _accelerator_backends for d in jax.devices())
+print(f"Training with accelerator: {_has_accelerator}")
 cfg = get_config() if _has_accelerator else get_cpu_test_config()
 
 
@@ -548,6 +549,7 @@ if __name__ == "__main__":
         if (
             val_dataset is not None
             and step % (cfg.val_check_steps * cfg.grad_acc_steps) == 0
+            and _has_accelerator
         ):
             t_val_start = time.time()
             val_loss_accum = 0.0
