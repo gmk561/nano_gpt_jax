@@ -6,3 +6,4 @@ ml-collections
 datasets
 tqdm
 requests
+orbax-checkpoint

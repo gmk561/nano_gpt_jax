@@ -5,6 +5,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 import optax
+import orbax.checkpoint as ocp
 from functools import partial
 from flax import nnx
 from typing import Callable
@@ -64,6 +65,14 @@ def get_config() -> ConfigDict:
     cfg.val_max_steps = 50  # max number of batches to use for validation
     cfg.max_steps = 10_000  # total training steps
 
+    # Checkpointing config
+    cfg.ckpt_dir = os.path.join(os.path.dirname(__file__), "checkpoints")
+    cfg.ckpt_every_steps = (
+        cfg.val_check_steps * 1
+    )  # save every N effective training steps, best align with validation checks to have the validation loss computed for the checkpoint.
+    cfg.ckpt_max_to_keep = 3  # keep N most recent + best val_loss
+    cfg.resume_ckpt = None  # step number, "latest", or None to start fresh
+
     # GPT model config
     cfg.model = ConfigDict()
     cfg.model.block_size = cfg.sequence_length
@@ -93,9 +102,7 @@ def get_cpu_test_config() -> ConfigDict:
 
 
 _accelerator_backends = {"gpu", "tpu"}
-_has_accelerator = any(
-    d.platform in _accelerator_backends for d in jax.devices()
-)
+_has_accelerator = any(d.platform in _accelerator_backends for d in jax.devices())
 cfg = get_config() if _has_accelerator else get_cpu_test_config()
 
 
@@ -405,6 +412,25 @@ def align_acc_step(step: int, gradient_acc_steps: int) -> int:
     return step // gradient_acc_steps
 
 
+# ── Checkpointing helpers ────────────────────────────────────────────────────
+
+
+def get_checkpoint_state(model: GPT, optimizer: nnx.Optimizer, step: int):
+    """Extract a checkpoint-friendly PyTree from NNX modules."""
+    return {
+        "model": nnx.state(model),
+        "optimizer": nnx.state(optimizer),
+        "step": np.int32(step),
+    }
+
+
+def restore_checkpoint_state(model: GPT, optimizer: nnx.Optimizer, state_dict) -> int:
+    """Restore NNX module state from a loaded checkpoint PyTree."""
+    nnx.update(model, state_dict["model"])
+    nnx.update(optimizer, state_dict["optimizer"])
+    return int(state_dict["step"])
+
+
 if __name__ == "__main__":
     # ── Training setup ──────────────────────────────────────────────────────────
 
@@ -462,11 +488,41 @@ if __name__ == "__main__":
         wrt=nnx.Param,
     )
 
+    # ── Checkpointing ────────────────────────────────────────────────────────────
+
+    ckpt_options = ocp.CheckpointManagerOptions(
+        max_to_keep=cfg.ckpt_max_to_keep,
+        best_fn=lambda metrics: metrics["val_loss"],
+        best_mode="min",
+        enable_async_checkpointing=True,
+    )
+    ckpt_mngr = ocp.CheckpointManager(
+        cfg.ckpt_dir,
+        options=ckpt_options,
+    )
+
+    # Resume from checkpoint if configured
+    start_step = 0
+    resume = cfg.resume_ckpt
+    if resume is not None:
+        restore_step = ckpt_mngr.latest_step() if resume == "latest" else int(resume)
+        if restore_step is not None:
+            abstract_state = get_checkpoint_state(model, optimizer, 0)
+            restored = ckpt_mngr.restore(
+                restore_step,
+                args=ocp.args.StandardRestore(abstract_state),
+            )
+            start_step = restore_checkpoint_state(model, optimizer, restored)
+            print(f"Resumed from checkpoint at step {start_step}")
+        else:
+            print("No checkpoint found to resume from, starting fresh")
+
     # ── Training loop ────────────────────────────────────────────────────────────
 
     max_steps = cfg.max_steps
+    last_val_loss = float("inf")  # track for checkpointing metrics
 
-    wandb.init(
+    run = wandb.init(
         project="nano-gpt-jax",
         mode=os.environ.get("WANDB_MODE", "online"),
         config={
@@ -483,9 +539,8 @@ if __name__ == "__main__":
         },
     )
 
-
     t0 = time.time()
-    for step, (x, y) in enumerate(dataset):
+    for step, (x, y) in enumerate(dataset, start=start_step):
         if step >= max_steps:
             break
 
@@ -506,10 +561,13 @@ if __name__ == "__main__":
             t_val_end = time.time()
             val_dt = t_val_end - t_val_start
 
-            total_val_tokens = val_steps * val_dataset.sequence_length * val_dataset.batch_size
+            total_val_tokens = (
+                val_steps * val_dataset.sequence_length * val_dataset.batch_size
+            )
             val_tokens_per_sec = total_val_tokens / val_dt
 
             val_loss = val_loss_accum / val_steps
+            last_val_loss = val_loss
             print(
                 f"step {align_acc_step(step, cfg.grad_acc_steps):4d} | validation loss {val_loss:.4f} | val_time {val_dt * 1000:.2f} ms | val_tokens/sec {val_tokens_per_sec:.2f}"
             )
@@ -521,13 +579,41 @@ if __name__ == "__main__":
                 },
                 step=align_acc_step(step, cfg.grad_acc_steps),
             )
+
+            # ── Checkpoint (async) ───────────────────────────────────────────
+            eff_step = align_acc_step(step, cfg.grad_acc_steps)
+            if eff_step > 0 and eff_step % cfg.ckpt_every_steps == 0:
+                ckpt_state = get_checkpoint_state(model, optimizer, eff_step)
+                ckpt_mngr.save(
+                    eff_step,
+                    args=ocp.args.StandardSave(ckpt_state),
+                    metrics={"val_loss": val_loss},
+                )
+                print(f"  → checkpoint saved at step {eff_step}")
+
+                # Upload to W&B as artifact
+                if not isinstance(wandb, type) or wandb is not MockWandb:
+                    try:
+                        ckpt_mngr.wait_until_finished()
+                        artifact = wandb.Artifact(
+                            f"checkpoint-step-{eff_step}", type="model"
+                        )
+                        ckpt_path = os.path.join(cfg.ckpt_dir, str(eff_step))
+                        if os.path.isdir(ckpt_path):
+                            artifact.add_dir(ckpt_path)
+                            run.log_artifact(artifact)
+                    except Exception as e:
+                        print(f"  ⚠ W&B artifact upload failed: {e}")
+
             # Reset timer so validation time doesn't pollute training throughput
             t0 = time.time()
 
         loss = train_step(model, optimizer, x, y)
         loss.block_until_ready()  # Ensure GPU work is done before measuring time
         dt = time.time() - t0
-        tokens_per_sec = dataset.sequence_length * dataset.batch_size * cfg.grad_acc_steps / dt
+        tokens_per_sec = (
+            dataset.sequence_length * dataset.batch_size * cfg.grad_acc_steps / dt
+        )
 
         if step % cfg.grad_acc_steps == 0:
             wandb.log(
@@ -544,4 +630,7 @@ if __name__ == "__main__":
             )
             t0 = time.time()
 
-    wandb.finish()
+    # ── Cleanup ──────────────────────────────────────────────────────────────────
+    ckpt_mngr.wait_until_finished()
+    ckpt_mngr.close()
+    run.finish()

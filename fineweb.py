@@ -34,6 +34,12 @@ parser.add_argument(
     default=None,
     help="Stop after writing this many shards (default: write all shards).",
 )
+parser.add_argument(
+    "--num-steps",
+    type=int,
+    default=100,
+    help="Number of training steps to download data for. Use -1 to download the whole dataset.",
+)
 args = parser.parse_args()
 
 local_dir = "edu_fineweb10B"
@@ -45,7 +51,27 @@ if args.smoke_test:
     shard_size = 1024 * 16 + 1  # tiny shard (B * T + 1) to accommodate target shift
     total_shards = 4  # 2 val + 2 train
 else:
-    total_shards = args.num_shards
+    if args.num_steps == -1:
+        total_shards = args.num_shards
+    else:
+        # Fetch GPT batch size (tokens per step) from transformer configuration statically
+        gpt_batch_size = 524288  # default fallback
+
+        # Compute required shards based on training steps and batch size
+        train_tokens = args.num_steps * gpt_batch_size
+        train_shards = int(np.ceil(train_tokens / shard_size))
+        train_shards = max(1, train_shards)
+        total_shards = val_shards + train_shards
+        print(f"Configured for first {args.num_steps} steps of training:")
+        print(f"  GPT batch size: {gpt_batch_size} tokens/step")
+        print(f"  Required training tokens: {train_tokens}")
+        print(
+            f"  Required shards: {train_shards} train + {val_shards} val = {total_shards} total shards"
+        )
+
+        # If user also passed --num-shards, take the minimum of both limits
+        if args.num_shards is not None:
+            total_shards = min(total_shards, args.num_shards)
 
 # create the cache the local directory if it doesn't exist yet
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
