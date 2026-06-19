@@ -24,7 +24,6 @@ source_id: Which video or WikiHow article this example came from
 The validation set of HellaSwag has a total of 10,042 examples.
 """
 
-from datasets import download
 import os
 import json
 import argparse
@@ -237,10 +236,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Import here to avoid circular issues when used as a library
-    from transformer import get_config, GPT
+    from transformer import get_config, GPT, _accelerator_backends
+    from data import GPT2_VOCAB_SIZE
 
     cfg = get_config()
-    rngs = nnx.Rngs(0)
-    model = GPT(cfg.model, rngs=rngs)
+    cfg.model.vocab_size = GPT2_VOCAB_SIZE
 
-    evaluate(model, split=args.split, max_examples=args.max_examples)
+    mesh = jax.make_mesh((cfg.num_devices, 1), ("data", "model"))
+    rngs = nnx.Rngs(0)
+
+    with jax.set_mesh(mesh):
+        model = GPT(cfg.model, rngs=rngs)
+        evaluate(model, split=args.split, max_examples=args.max_examples)

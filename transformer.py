@@ -13,18 +13,24 @@ if os.path.exists(".env"):
 if "XLA_FLAGS" not in os.environ:
     os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 
+import json
 import time
-import tiktoken
 import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 import optax
 import orbax.checkpoint as ocp
-from functools import partial
 from flax import nnx
-from typing import Callable
 from ml_collections import ConfigDict
+
+from data import (
+    GPT2_VOCAB_SIZE,
+    create_train_loader,
+    create_val_loader,
+    get_iter_state,
+    restore_iter_state,
+)
 
 nnx.use_eager_sharding(True)
 
@@ -73,6 +79,7 @@ def get_config() -> ConfigDict:
     cfg.val_check_steps = 100  # evaluate validation loss every 100 steps
     cfg.val_max_steps = 50  # max number of batches to use for validation
     cfg.max_steps = 10_000  # total training steps
+    cfg.warmup_steps = 715
 
     # Checkpointing config
     cfg.ckpt_dir = os.path.join(os.path.dirname(__file__), "checkpoints")
@@ -106,6 +113,7 @@ def get_cpu_test_config() -> ConfigDict:
     cfg.val_check_steps = 10  # evaluate validation loss every 10 steps
     cfg.val_max_steps = 4  # max number of batches to use for validation
     cfg.max_steps = 50  # total training steps
+    cfg.warmup_steps = 10
 
     cfg.model.n_layer = 3
     cfg.model.n_head = 2
@@ -117,12 +125,6 @@ def get_cpu_test_config() -> ConfigDict:
 
 
 _accelerator_backends = {"gpu", "tpu"}
-_has_accelerator = any(d.platform in _accelerator_backends for d in jax.devices())
-print(f"Training with accelerator: {_has_accelerator}")
-cfg = get_config() if _has_accelerator else get_cpu_test_config()
-
-# 2D mesh: ('data', 'model'). For now model=1; later change to (dp, mp) for tensor parallelism.
-mesh = jax.make_mesh((cfg.num_devices, 1), ("data", "model"))
 
 
 class MLP(nnx.Module):
@@ -217,6 +219,10 @@ class GPT(nnx.Module):
             [Block(config, rngs=rngs) for _ in range(config.n_layer)]
         )
         self.ln_f = nnx.LayerNorm(config.n_embd, rngs=rngs)
+        # Pre-compute causal mask once for the full block_size; slice at call time.
+        self._causal_mask = jnp.tril(
+            jnp.ones((1, 1, config.block_size, config.block_size), dtype=jnp.bool_)
+        )
         self._init_weights(rngs)
 
     def _init_weights(self, rngs: nnx.Rngs):
@@ -281,9 +287,10 @@ class GPT(nnx.Module):
 
         _apply(self)
 
-    def __call__(self, x: jnp.ndarray):
+    def __call__(self, x: jax.Array):
         B, T = x.shape
-        mask = nnx.make_causal_mask(x)
+        # Slice the pre-computed mask for the actual sequence length.
+        mask = self._causal_mask[:, :, :T, :T]
         pos = jnp.arange(T)
         x = self.wte(x, out_sharding=jax.typeof(x).sharding) + self.wpe(
             pos
@@ -313,116 +320,8 @@ class CharTokenizer:
         return "".join(self.itos[i] for i in tokens)
 
 
-class DataLoader:
-    def __init__(self, batch_size: int, sequence_length: int):
-
-        with open("input.txt", "r", encoding="utf-8") as f:
-            text = f.read()
-
-        # self.enc = CharTokenizer(text)
-        self.enc = tiktoken.get_encoding("gpt2")
-        # self.vocab_size = self.enc.vocab_size
-        self.vocab_size = self.enc.n_vocab
-        self.tokens = jnp.array(self.enc.encode(text))
-        self.batch_size = batch_size
-        self.sequence_length = sequence_length
-        self.idx = 0
-
-    def __next__(self):
-        if self.idx + self.sequence_length * self.batch_size >= len(self.tokens):
-            self.idx = 0
-
-        x = self.tokens[self.idx : self.idx + self.sequence_length * self.batch_size]
-        y = self.tokens[
-            self.idx + 1 : self.idx + self.sequence_length * self.batch_size + 1
-        ]
-
-        self.idx += self.sequence_length * self.batch_size
-
-        return x.reshape(self.batch_size, self.sequence_length), y.reshape(
-            self.batch_size, self.sequence_length
-        )
-
-    def __iter__(self):
-        self.idx = 0
-        return self
-
-    def __len__(self):
-        return len(self.tokens) // (self.sequence_length * self.batch_size)
-
-
-class EduFinewebDataLoader:
-    """Streams pre-tokenized .npy shards produced by fineweb.py.
-
-    Shards live in ``data_dir`` with names like
-    ``edufineweb_train_000001.npy`` / ``edufineweb_val_000000.npy``.
-
-    The loader cycles through all shards for the given *split*, advancing
-    the internal pointer exactly like the simple DataLoader above.
-    """
-
-    DATA_DIR = os.path.join(os.path.dirname(__file__), "edu_fineweb10B")
-
-    def __init__(self, batch_size: int, sequence_length: int, split: str = "train"):
-        self.batch_size = batch_size
-        self.sequence_length = sequence_length
-        self.split = split
-
-        # GPT-2 vocab size (fixed for this tokenizer)
-        self.vocab_size = tiktoken.get_encoding("gpt2").n_vocab
-
-        # Discover shard files for this split, sorted by index
-        self.shard_paths = sorted(
-            [
-                os.path.join(self.DATA_DIR, f)
-                for f in os.listdir(self.DATA_DIR)
-                if f.startswith(f"edufineweb_{split}_") and f.endswith(".npy")
-            ]
-        )
-        if not self.shard_paths:
-            raise FileNotFoundError(
-                f"No .npy shards found for split='{split}' in {self.DATA_DIR}. "
-                f"Run `python fineweb.py` first."
-            )
-
-        self.shard_idx = 0
-        self.idx = 0
-        self._load_shard(0)
-
-    def _load_shard(self, shard_idx: int) -> None:
-        """Load a single shard into memory as a jnp int32 array."""
-        self.shard_idx = shard_idx % len(self.shard_paths)
-        self.tokens = jnp.array(
-            np.load(self.shard_paths[self.shard_idx]).astype(np.int32)
-        )
-        self.idx = 0
-
-    def __next__(self):
-        B, T = self.batch_size, self.sequence_length
-        needed = B * T + 1  # +1 for the target shift
-
-        # If the current shard is exhausted, advance to the next one
-        if self.idx + needed > len(self.tokens):
-            self.shard_idx += 1
-            self._load_shard(self.shard_idx)
-
-        buf = self.tokens[self.idx : self.idx + needed]
-        x = buf[:-1].reshape(B, T)
-        y = buf[1:].reshape(B, T)
-        self.idx += B * T
-        return x, y
-
-    def __iter__(self):
-        self._load_shard(0)
-        return self
-
-    def __len__(self):
-        """Approximate total steps across all shards (each shard counted once)."""
-        total_tokens = sum(
-            os.path.getsize(p) // 2  # uint16 → 2 bytes per token
-            for p in self.shard_paths
-        )
-        return total_tokens // (self.sequence_length * self.batch_size)
+# DataLoader and EduFinewebDataLoader have been moved to data.py (Grain-based).
+# Use create_train_loader() / create_val_loader() from that module instead.
 
 
 def cast_params(module: nnx.Module, dtype):
@@ -483,8 +382,18 @@ def align_acc_step(step: int, gradient_acc_steps: int) -> int:
 # ── Checkpointing helpers ────────────────────────────────────────────────────
 
 
-def get_checkpoint_state(model: GPT, optimizer: nnx.Optimizer, step: int):
-    """Extract a checkpoint-friendly PyTree from NNX modules."""
+def get_checkpoint_state(
+    model: GPT,
+    optimizer: nnx.Optimizer,
+    step: int,
+) -> dict:
+    """Extract a checkpoint-friendly PyTree from NNX modules.
+
+    Data-loader position is **not** stored here; it is written separately as a
+    Grain state file (``grain_train_state.bin``) alongside each Orbax
+    checkpoint directory.  Use :func:`get_iter_state` /
+    :func:`restore_iter_state` from ``data.py`` for that.
+    """
     return {
         "model": nnx.state(model),
         "optimizer": nnx.state(optimizer),
@@ -492,8 +401,18 @@ def get_checkpoint_state(model: GPT, optimizer: nnx.Optimizer, step: int):
     }
 
 
-def restore_checkpoint_state(model: GPT, optimizer: nnx.Optimizer, state_dict) -> int:
-    """Restore NNX module state from a loaded checkpoint PyTree."""
+def restore_checkpoint_state(
+    model: GPT,
+    optimizer: nnx.Optimizer,
+    state_dict,
+) -> int:
+    """Restore NNX module state from a loaded checkpoint PyTree.
+
+    Returns
+    -------
+    int
+        The effective training step stored in the checkpoint.
+    """
     nnx.update(model, state_dict["model"])
     nnx.update(optimizer, state_dict["optimizer"])
     return int(state_dict["step"])
@@ -501,27 +420,22 @@ def restore_checkpoint_state(model: GPT, optimizer: nnx.Optimizer, state_dict) -
 
 if __name__ == "__main__":
     # ── Training setup ──────────────────────────────────────────────────────────
+    _has_accelerator = any(d.platform in _accelerator_backends for d in jax.devices())
+    print(f"Training with accelerator: {_has_accelerator}")
+    cfg = get_config() if _has_accelerator else get_cpu_test_config()
+    # 2D mesh: ('data', 'model'). For now model=1; later change to (dp, mp) for tensor parallelism.
+    mesh = jax.make_mesh((cfg.num_devices, 1), ("data", "model"))
 
-    if cfg.dataset == "edu_fineweb":
-        dataset = EduFinewebDataLoader(
-            batch_size=cfg.batch_size,
-            sequence_length=cfg.sequence_length,
-            split="train",
-        )
-        val_dataset = EduFinewebDataLoader(
-            batch_size=cfg.batch_size,
-            sequence_length=cfg.sequence_length,
-            split="val",
-        )
-    else:
-        dataset = DataLoader(
-            batch_size=cfg.batch_size, sequence_length=cfg.sequence_length
-        )
-        val_dataset = None
+    # Build Grain data loaders (support multi-host data parallelism via
+    # ShardByJaxProcess; on a single process this is equivalent to NoSharding).
+    train_loader = create_train_loader(cfg)
+    val_loader = create_val_loader(cfg)  # None for input_txt dataset
 
-    cfg.model.vocab_size = (
-        dataset.vocab_size
-    )  # derived from the actual characters in the text
+    # Both datasets use the GPT-2 tokenizer.
+    cfg.model.vocab_size = GPT2_VOCAB_SIZE
+
+    # Create a persistent training iterator so we can checkpoint its position.
+    train_iter = iter(train_loader)
 
     with jax.set_mesh(mesh):
         rngs = nnx.Rngs(0)
@@ -536,23 +450,35 @@ if __name__ == "__main__":
         print("wpe sharding", model.wpe.embedding.sharding)
 
         learning_rate = 6e-4
-        warmup_steps = 10
-        decay_steps = cfg.max_steps - warmup_steps
+        decay_steps = cfg.max_steps - cfg.warmup_steps
 
         schedule = optax.warmup_cosine_decay_schedule(
             init_value=0.0,
             peak_value=learning_rate,
-            warmup_steps=warmup_steps,
+            warmup_steps=cfg.warmup_steps,
             decay_steps=decay_steps,
             end_value=learning_rate * 0.1,
         )
 
+        def decay_mask(params):
+            return jax.tree_util.tree_map(lambda p: p.ndim >= 2, params)
+
         tx = optax.chain(
             optax.clip_by_global_norm(1.0),
-            optax.adamw(schedule, b1=0.9, b2=0.95, eps=1e-8, weight_decay=0.1),
+            optax.adamw(
+                schedule,
+                b1=0.9,
+                b2=0.95,
+                eps=1e-8,
+                weight_decay=0.1,
+                mask=decay_mask,
+            ),
         )
+
         if cfg.grad_acc_steps > 1:
-            tx = optax.MultiSteps(tx, every_k_schedule=cfg.grad_acc_steps)
+            tx = optax.MultiSteps(
+                tx, every_k_schedule=cfg.grad_acc_steps, use_grad_mean=True
+            )
 
         optimizer = nnx.Optimizer(
             model,
@@ -588,6 +514,19 @@ if __name__ == "__main__":
                 )
                 start_step = restore_checkpoint_state(model, optimizer, restored)
                 print(f"Resumed from checkpoint at step {start_step}")
+
+                # Restore Grain iterator state if the companion file exists.
+                grain_state_path = os.path.join(
+                    cfg.ckpt_dir, str(restore_step), "grain_train_state.bin"
+                )
+                if os.path.exists(grain_state_path):
+                    with open(grain_state_path, "rb") as fh:
+                        restore_iter_state(train_iter, fh.read())
+                    print("  → Grain data iterator restored from checkpoint")
+                else:
+                    print(
+                        "  → no Grain iterator state found; data starts from epoch beginning"
+                    )
             else:
                 print("No checkpoint found to resume from, starting fresh")
 
@@ -614,46 +553,51 @@ if __name__ == "__main__":
         )
 
         t0 = time.time()
-        for step, (x, y) in enumerate(dataset, start=start_step):
+        for micro_step, batch in enumerate(
+            train_iter, start=start_step * cfg.grad_acc_steps
+        ):
+            step = micro_step // cfg.grad_acc_steps
             if step >= max_steps:
                 break
 
             # Validation evaluation
             if (
-                val_dataset is not None
-                and step % (cfg.val_check_steps * cfg.grad_acc_steps) == 0
+                step % cfg.val_check_steps == 0
+                and val_loader is not None
                 and _has_accelerator
             ):
                 t_val_start = time.time()
                 val_loss_accum = 0.0
-                val_steps = min(cfg.val_max_steps, len(val_dataset))
-                val_iter = iter(val_dataset)
+                val_steps = 0
 
-                for _ in range(val_steps):
-                    x_val, y_val = next(val_iter)
+                # Each iter() call restarts from the beginning of the val split
+                # (num_epochs=1 in the val loader).
+                for val_batch in iter(val_loader):
+                    if val_steps >= cfg.val_max_steps:
+                        break
                     # Shard validation inputs along the data dimension
                     x_val_sharded = jax.device_put(
-                        x_val, NamedSharding(mesh, P("data", None))
+                        val_batch["x"], NamedSharding(mesh, P("data", None))
                     )
                     y_val_sharded = jax.device_put(
-                        y_val, NamedSharding(mesh, P("data", None))
+                        val_batch["y"], NamedSharding(mesh, P("data", None))
                     )
                     v_loss = val_step(model, x_val_sharded, y_val_sharded)
                     val_loss_accum += v_loss.item()
+                    val_steps += 1
+
                 t_val_end = time.time()
                 val_dt = t_val_end - t_val_start
 
-                total_val_tokens = (
-                    val_steps * val_dataset.sequence_length * val_dataset.batch_size
-                )
-                val_tokens_per_sec = total_val_tokens / val_dt
+                total_val_tokens = val_steps * cfg.sequence_length * cfg.batch_size
+                val_tokens_per_sec = total_val_tokens / val_dt if val_dt > 0 else 0.0
 
-                val_loss = val_loss_accum / val_steps
+                val_loss = val_loss_accum / val_steps if val_steps > 0 else float("inf")
                 last_val_loss = val_loss
                 print(
                     f"step {align_acc_step(step, cfg.grad_acc_steps):4d} | validation loss {val_loss:.4f} | val_time {val_dt * 1000:.2f} ms | val_tokens/sec {val_tokens_per_sec:.2f}"
                 )
-                wandb.log(
+                run.log(
                     {
                         "val_loss": val_loss,
                         "val_time_ms": val_dt * 1000,
@@ -673,10 +617,20 @@ if __name__ == "__main__":
                     )
                     print(f"  → checkpoint saved at step {eff_step}")
 
+                    # Wait for the async Orbax write to finish so the step
+                    # directory exists before we write the Grain state file.
+                    ckpt_mngr.wait_until_finished()
+
+                    # Persist Grain iterator state alongside the checkpoint.
+                    grain_state_path = os.path.join(
+                        cfg.ckpt_dir, str(eff_step), "grain_train_state.bin"
+                    )
+                    with open(grain_state_path, "wb") as fh:
+                        fh.write(get_iter_state(train_iter))
+
                     # Upload to W&B as artifact
-                    if not isinstance(wandb, type) or wandb is not MockWandb:
+                    if not isinstance(wandb, MockWandb):
                         try:
-                            ckpt_mngr.wait_until_finished()
                             artifact = wandb.Artifact(
                                 f"checkpoint-step-{eff_step}", type="model"
                             )
@@ -690,19 +644,17 @@ if __name__ == "__main__":
                 # Reset timer so validation time doesn't pollute training throughput
                 t0 = time.time()
 
-            # Shard training inputs along the data dimension
-            x_sharded = jax.device_put(x, NamedSharding(mesh, P("data", None)))
-            y_sharded = jax.device_put(y, NamedSharding(mesh, P("data", None)))
+            # Shard training batch along the data mesh dimension
+            x_sharded = jax.device_put(batch["x"], NamedSharding(mesh, P("data", None)))
+            y_sharded = jax.device_put(batch["y"], NamedSharding(mesh, P("data", None)))
             loss = train_step(model, optimizer, x_sharded, y_sharded)
-            loss.block_until_ready()  # Ensure GPU work is done before measuring time
+            loss.block_until_ready()  # ensure device work is done before timing
             dt = time.time() - t0
-            tokens_per_sec = (
-                dataset.sequence_length * dataset.batch_size * cfg.grad_acc_steps / dt
-            )
+            tokens_per_sec = cfg.sequence_length * cfg.batch_size / dt
 
             if step % cfg.grad_acc_steps == 0:
-                total_tokens = step * dataset.sequence_length * dataset.batch_size
-                wandb.log(
+                total_tokens = step * cfg.sequence_length * cfg.batch_size
+                run.log(
                     {
                         "loss": loss.item(),
                         "step_time_ms": dt * 1000,
