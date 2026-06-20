@@ -119,7 +119,7 @@ def get_cpu_test_config() -> ConfigDict:
     cfg.model.n_head = 2
     cfg.model.n_embd = 8
 
-    # cfg.dataset = "input_txt"
+    cfg.dataset = "input_txt"
 
     return cfg
 
@@ -556,13 +556,12 @@ if __name__ == "__main__":
         for micro_step, batch in enumerate(
             train_iter, start=start_step * cfg.grad_acc_steps
         ):
-            step = micro_step // cfg.grad_acc_steps
-            if step >= max_steps:
+            if micro_step >= max_steps * cfg.grad_acc_steps:
                 break
 
             # Validation evaluation
             if (
-                step % cfg.val_check_steps == 0
+                micro_step % (cfg.val_check_steps * cfg.grad_acc_steps) == 0
                 and val_loader is not None
                 and _has_accelerator
             ):
@@ -595,7 +594,7 @@ if __name__ == "__main__":
                 val_loss = val_loss_accum / val_steps if val_steps > 0 else float("inf")
                 last_val_loss = val_loss
                 print(
-                    f"step {align_acc_step(step, cfg.grad_acc_steps):4d} | validation loss {val_loss:.4f} | val_time {val_dt * 1000:.2f} ms | val_tokens/sec {val_tokens_per_sec:.2f}"
+                    f"step {align_acc_step(micro_step, cfg.grad_acc_steps):4d} | validation loss {val_loss:.4f} | val_time {val_dt * 1000:.2f} ms | val_tokens/sec {val_tokens_per_sec:.2f}"
                 )
                 run.log(
                     {
@@ -603,11 +602,11 @@ if __name__ == "__main__":
                         "val_time_ms": val_dt * 1000,
                         "val_tokens_per_sec": val_tokens_per_sec,
                     },
-                    step=align_acc_step(step, cfg.grad_acc_steps),
+                    step=align_acc_step(micro_step, cfg.grad_acc_steps),
                 )
 
                 # ── Checkpoint (async) ───────────────────────────────────────────
-                eff_step = align_acc_step(step, cfg.grad_acc_steps)
+                eff_step = align_acc_step(micro_step, cfg.grad_acc_steps)
                 if eff_step > 0 and eff_step % cfg.ckpt_every_steps == 0:
                     ckpt_state = get_checkpoint_state(model, optimizer, eff_step)
                     ckpt_mngr.save(
@@ -652,8 +651,12 @@ if __name__ == "__main__":
             dt = time.time() - t0
             tokens_per_sec = cfg.sequence_length * cfg.batch_size / dt
 
-            if step % cfg.grad_acc_steps == 0:
-                total_tokens = step * cfg.sequence_length * cfg.batch_size
+            if micro_step % cfg.grad_acc_steps == 0:
+                total_tokens = (
+                    (micro_step // cfg.grad_acc_steps)
+                    * cfg.sequence_length
+                    * cfg.batch_size
+                )
                 run.log(
                     {
                         "loss": loss.item(),
@@ -662,10 +665,10 @@ if __name__ == "__main__":
                         "learning_rate": schedule(optimizer.step[...]).item(),
                         "total_tokens": total_tokens,
                     },
-                    step=align_acc_step(step, cfg.grad_acc_steps),
+                    step=align_acc_step(micro_step, cfg.grad_acc_steps),
                 )
                 print(
-                    f"step {align_acc_step(step, cfg.grad_acc_steps):4d} | loss {loss:.4f} | lr: {schedule(optimizer.step[...]):.4f} | time {dt * 1000:.2f} ms | tokens/sec {tokens_per_sec:.2f} | tokens {total_tokens}"
+                    f"step {align_acc_step(micro_step, cfg.grad_acc_steps):4d} | loss {loss:.4f} | lr: {schedule(optimizer.step[...]):.4f} | time {dt * 1000:.2f} ms | tokens/sec {tokens_per_sec:.2f} | tokens {total_tokens}"
                 )
                 t0 = time.time()
 
