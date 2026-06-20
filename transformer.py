@@ -10,8 +10,9 @@ if os.path.exists(".env"):
                 os.environ[key.strip()] = val.strip()
 
 # Emulate 8 CPU devices by default if no XLA_FLAGS are set
-if "XLA_FLAGS" not in os.environ:
-    os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
+# if "XLA_FLAGS" not in os.environ:
+#     print("Setting XLA_FLAGS for 8 CPU devices")
+#     os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
 
 import json
 import time
@@ -32,33 +33,32 @@ from data import (
     restore_iter_state,
 )
 
-nnx.use_eager_sharding(True)
-
 print("jax.device_count():", jax.device_count())
 
+nnx.use_eager_sharding(True)
+
+
+class MockWandb:
+    @staticmethod
+    def init(*args, **kwargs):
+        class Run:
+            def log(self, *args, **kwargs):
+                pass
+
+            def finish(self, *args, **kwargs):
+                pass
+
+        return Run()
+
+    @staticmethod
+    def log(*args, **kwargs):
+        pass
+
+    @staticmethod
+    def finish(*args, **kwargs):
+        pass
 
 if os.environ.get("WANDB_MODE") == "disabled":
-
-    class MockWandb:
-        @staticmethod
-        def init(*args, **kwargs):
-            class Run:
-                def log(self, *args, **kwargs):
-                    pass
-
-                def finish(self, *args, **kwargs):
-                    pass
-
-            return Run()
-
-        @staticmethod
-        def log(*args, **kwargs):
-            pass
-
-        @staticmethod
-        def finish(*args, **kwargs):
-            pass
-
     wandb = MockWandb()
 else:
     import wandb
@@ -648,12 +648,12 @@ if __name__ == "__main__":
             y_sharded = jax.device_put(batch["y"], NamedSharding(mesh, P("data", None)))
             loss = train_step(model, optimizer, x_sharded, y_sharded)
             loss.block_until_ready()  # ensure device work is done before timing
-            dt = time.time() - t0
-            tokens_per_sec = cfg.sequence_length * cfg.batch_size / dt
 
             if micro_step % cfg.grad_acc_steps == 0:
+                dt = time.time() - t0
+                tokens_per_sec = cfg.sequence_length * cfg.batch_size * cfg.grad_acc_steps / dt
                 total_tokens = (
-                    (micro_step // cfg.grad_acc_steps)
+                    micro_step * cfg.grad_acc_steps
                     * cfg.sequence_length
                     * cfg.batch_size
                 )
