@@ -24,6 +24,7 @@ import optax
 import orbax.checkpoint as ocp
 from flax import nnx
 from ml_collections import ConfigDict
+import functools
 
 from data import (
     GPT2_VOCAB_SIZE,
@@ -158,6 +159,32 @@ class MLP(nnx.Module):
         return self.linear_2(nnx.gelu(self.linear_1(x)))
 
 
+def is_cudnn_available():
+    try:
+        from jax._src.lib import cuda_versions
+
+        return (
+            cuda_versions is not None and cuda_versions.cudnn_get_version() is not None
+        )
+    except (ImportError, AttributeError, RuntimeError):
+        return False
+
+
+def flash_attention_fn(
+    query, key, value, bias=None, mask=None, is_causal=True, **kwargs
+):
+    impl = "cudnn" if is_cudnn_available() else "xla"
+    return jax.nn.dot_product_attention(
+        query,
+        key,
+        value,
+        bias=bias,
+        mask=mask if not is_causal else None,
+        is_causal=is_causal,
+        implementation=impl,
+    )
+
+
 class Block(nnx.Module):
     def __init__(self, config: ConfigDict, rngs: nnx.Rngs):
         self.config = config
@@ -180,6 +207,7 @@ class Block(nnx.Module):
             bias_metadata={"out_sharding": (None,)},
             out_bias_init=nnx.initializers.zeros_init(),
             out_bias_metadata={"out_sharding": (None,)},
+            attention_fn=functools.partial(flash_attention_fn, is_causal=True),
         )
         self.mlp = MLP(config, rngs=rngs)
         self.layernorm_1 = nnx.LayerNorm(config.n_embd, rngs=rngs)
@@ -344,11 +372,13 @@ def apply_dtype_policy(model: nnx.Module, cfg):
 
 
 def dtype_report(model: nnx.Module):
-    for path, module in model.iter_modules():
+    for path, module in nnx.iter_modules(model):
         for attr in ("kernel", "embedding", "scale", "bias"):
             param = getattr(module, attr, None)
             if param is not None and hasattr(param, "value"):
-                print(f"{path} {attr} {param[...].dtype}")
+                dtype = param[...].dtype
+                if dtype == jnp.float32:
+                    print(f"{path} {attr} {dtype}")
 
 
 def loss_fn(model: GPT, x: jnp.ndarray, y: jnp.ndarray):
@@ -422,6 +452,8 @@ if __name__ == "__main__":
     # ── Training setup ──────────────────────────────────────────────────────────
     _has_accelerator = any(d.platform in _accelerator_backends for d in jax.devices())
     print(f"Training with accelerator: {_has_accelerator}")
+    print("Is cudnn available? ", is_cudnn_available())
+
     cfg = get_config() if _has_accelerator else get_cpu_test_config()
     # 2D mesh: ('data', 'model'). For now model=1; later change to (dp, mp) for tensor parallelism.
     mesh = jax.make_mesh((cfg.num_devices, 1), ("data", "model"))
@@ -445,9 +477,6 @@ if __name__ == "__main__":
             apply_dtype_policy(model, cfg.model)
 
         dtype_report(model)
-
-        print("wte sharding", model.wte.embedding.sharding)
-        print("wpe sharding", model.wpe.embedding.sharding)
 
         learning_rate = 6e-4
         decay_steps = cfg.max_steps - cfg.warmup_steps
