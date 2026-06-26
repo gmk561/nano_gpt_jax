@@ -10,3 +10,5 @@ tqdm
 requests
 orbax-checkpoint
 grain
+matplotlib
+pandas-stubs

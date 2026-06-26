@@ -59,6 +59,7 @@ class MockWandb:
     def finish(*args, **kwargs):
         pass
 
+
 if os.environ.get("WANDB_MODE") == "disabled":
     wandb = MockWandb()
 else:
@@ -83,7 +84,8 @@ def get_config() -> ConfigDict:
     cfg.warmup_steps = 715
 
     # Checkpointing config
-    cfg.ckpt_dir = os.path.join(os.path.dirname(__file__), "checkpoints")
+    cfg.ckpt_dir_name = "checkpoints"
+    cfg.ckpt_dir = os.path.join(os.path.dirname(__file__), cfg.ckpt_dir_name)
     cfg.ckpt_every_steps = (
         cfg.val_check_steps * 1
     )  # save every N effective training steps, best align with validation checks to have the validation loss computed for the checkpoint.
@@ -113,12 +115,14 @@ def get_cpu_test_config() -> ConfigDict:
     cfg.grad_acc_steps = 1
     cfg.val_check_steps = 10  # evaluate validation loss every 10 steps
     cfg.val_max_steps = 4  # max number of batches to use for validation
-    cfg.max_steps = 50  # total training steps
+    cfg.max_steps = 200  # total training steps
     cfg.warmup_steps = 10
+    # cfg.resume_ckpt = "latest"  # step number, "latest", or None to start fresh
+    cfg.resume_ckpt = 100  # step number, "latest", or None to start fresh
 
     cfg.model.n_layer = 3
     cfg.model.n_head = 2
-    cfg.model.n_embd = 8
+    cfg.model.n_embd = 16
 
     cfg.dataset = "input_txt"
 
@@ -427,7 +431,7 @@ def get_checkpoint_state(
     return {
         "model": nnx.state(model),
         "optimizer": nnx.state(optimizer),
-        "step": np.int32(step),
+        "step": step,
     }
 
 
@@ -588,51 +592,53 @@ if __name__ == "__main__":
             if micro_step >= max_steps * cfg.grad_acc_steps:
                 break
 
-            # Validation evaluation
-            if (
-                micro_step % (cfg.val_check_steps * cfg.grad_acc_steps) == 0
-                and val_loader is not None
-                and _has_accelerator
-            ):
-                t_val_start = time.time()
-                val_loss_accum = 0.0
-                val_steps = 0
+            # Validation evaluation / Checkpointing
+            if micro_step % (cfg.val_check_steps * cfg.grad_acc_steps) == 0:
+                val_loss = last_val_loss
+                if val_loader is not None:
+                    t_val_start = time.time()
+                    val_loss_accum = 0.0
+                    val_steps = 0
 
-                # Each iter() call restarts from the beginning of the val split
-                # (num_epochs=1 in the val loader).
-                for val_batch in iter(val_loader):
-                    if val_steps >= cfg.val_max_steps:
-                        break
-                    # Shard validation inputs along the data dimension
-                    x_val_sharded = jax.device_put(
-                        val_batch["x"], NamedSharding(mesh, P("data", None))
+                    # Each iter() call restarts from the beginning of the val split
+                    # (num_epochs=1 in the val loader).
+                    for val_batch in iter(val_loader):
+                        if val_steps >= cfg.val_max_steps:
+                            break
+                        # Shard validation inputs along the data dimension
+                        x_val_sharded = jax.device_put(
+                            val_batch["x"], NamedSharding(mesh, P("data", None))
+                        )
+                        y_val_sharded = jax.device_put(
+                            val_batch["y"], NamedSharding(mesh, P("data", None))
+                        )
+                        v_loss = val_step(model, x_val_sharded, y_val_sharded)
+                        val_loss_accum += v_loss.item()
+                        val_steps += 1
+
+                    t_val_end = time.time()
+                    val_dt = t_val_end - t_val_start
+
+                    total_val_tokens = val_steps * cfg.sequence_length * cfg.batch_size
+                    val_tokens_per_sec = (
+                        total_val_tokens / val_dt if val_dt > 0 else 0.0
                     )
-                    y_val_sharded = jax.device_put(
-                        val_batch["y"], NamedSharding(mesh, P("data", None))
+
+                    val_loss = (
+                        val_loss_accum / val_steps if val_steps > 0 else float("inf")
                     )
-                    v_loss = val_step(model, x_val_sharded, y_val_sharded)
-                    val_loss_accum += v_loss.item()
-                    val_steps += 1
-
-                t_val_end = time.time()
-                val_dt = t_val_end - t_val_start
-
-                total_val_tokens = val_steps * cfg.sequence_length * cfg.batch_size
-                val_tokens_per_sec = total_val_tokens / val_dt if val_dt > 0 else 0.0
-
-                val_loss = val_loss_accum / val_steps if val_steps > 0 else float("inf")
-                last_val_loss = val_loss
-                print(
-                    f"step {align_acc_step(micro_step, cfg.grad_acc_steps):4d} | validation loss {val_loss:.4f} | val_time {val_dt * 1000:.2f} ms | val_tokens/sec {val_tokens_per_sec:.2f}"
-                )
-                run.log(
-                    {
-                        "val_loss": val_loss,
-                        "val_time_ms": val_dt * 1000,
-                        "val_tokens_per_sec": val_tokens_per_sec,
-                    },
-                    step=align_acc_step(micro_step, cfg.grad_acc_steps),
-                )
+                    last_val_loss = val_loss
+                    print(
+                        f"step {align_acc_step(micro_step, cfg.grad_acc_steps):4d} | validation loss {val_loss:.4f} | val_time {val_dt * 1000:.2f} ms | val_tokens/sec {val_tokens_per_sec:.2f}"
+                    )
+                    run.log(
+                        {
+                            "val_loss": val_loss,
+                            "val_time_ms": val_dt * 1000,
+                            "val_tokens_per_sec": val_tokens_per_sec,
+                        },
+                        step=align_acc_step(micro_step, cfg.grad_acc_steps),
+                    )
 
                 # ── Checkpoint (async) ───────────────────────────────────────────
                 eff_step = align_acc_step(micro_step, cfg.grad_acc_steps)
@@ -680,9 +686,12 @@ if __name__ == "__main__":
 
             if micro_step % cfg.grad_acc_steps == 0:
                 dt = time.time() - t0
-                tokens_per_sec = cfg.sequence_length * cfg.batch_size * cfg.grad_acc_steps / dt
+                tokens_per_sec = (
+                    cfg.sequence_length * cfg.batch_size * cfg.grad_acc_steps / dt
+                )
                 total_tokens = (
-                    micro_step * cfg.grad_acc_steps
+                    micro_step
+                    * cfg.grad_acc_steps
                     * cfg.sequence_length
                     * cfg.batch_size
                 )

@@ -24,7 +24,7 @@ fi
 echo "Configuring Git..."
 # We run git config as target user so the settings go into their home directory ~/.gitconfig
 sudo -u "$TARGET_USER" git config --global user.name "gm169"
-sudo -u "$TARGET_USER" git config --global user.email "grzesmakosa@gmail.com"
+sudo -u "$TARGET_USER" git config --global user.email "[EMAIL_ADDRESS]"
 
 # 4. Clone/Fetch Repository
 REPO_DIR="$USER_HOME/nano_gpt_jax"

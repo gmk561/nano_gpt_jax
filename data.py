@@ -59,7 +59,6 @@ if not _absl_flags.FLAGS.is_parsed():
     _absl_flags.FLAGS.mark_as_parsed()
 
 
-
 # ── Public constants ───────────────────────────────────────────────────────────
 
 #: GPT-2 vocabulary size; assign to ``cfg.model.vocab_size`` before building
@@ -110,6 +109,8 @@ class EduFinewebShardSource:
         data_dir: str = _EDU_FINEWEB_DATA_DIR,
     ) -> None:
         self._seq_len = sequence_length
+        self._split = split
+        self._data_dir = data_dir
 
         shard_paths = sorted(
             os.path.join(data_dir, f)
@@ -124,9 +125,7 @@ class EduFinewebShardSource:
         self._shard_paths = shard_paths
 
         # Read each shard's token count from the .npy header only (no full load).
-        token_counts = [
-            int(np.load(p, mmap_mode="r").shape[0]) for p in shard_paths
-        ]
+        token_counts = [int(np.load(p, mmap_mode="r").shape[0]) for p in shard_paths]
 
         # Non-overlapping windows per shard (need seq_len+1 consecutive tokens).
         seqs_per_shard = [max(0, (n - 1) // sequence_length) for n in token_counts]
@@ -140,6 +139,12 @@ class EduFinewebShardSource:
         self._cached_shard_idx: int | None = None
         self._cached_tokens: np.ndarray | None = None
 
+    def __repr__(self) -> str:
+        return (
+            f"EduFinewebShardSource(sequence_length={self._seq_len}, "
+            f"split={self._split!r}, data_dir={self._data_dir!r})"
+        )
+
     # ── Grain RandomAccessDataSource protocol ──────────────────────────────────
 
     def __len__(self) -> int:
@@ -151,9 +156,7 @@ class EduFinewebShardSource:
         local_idx = idx - self._cumulative[shard_idx]
 
         if self._cached_shard_idx != shard_idx:
-            self._cached_tokens = np.load(
-                self._shard_paths[shard_idx]
-            ).astype(np.int32)
+            self._cached_tokens = np.load(self._shard_paths[shard_idx]).astype(np.int32)
             self._cached_shard_idx = shard_idx
 
         start = local_idx * self._seq_len
@@ -188,9 +191,13 @@ class InputTxtSource:
         path: str = os.path.join(os.path.dirname(__file__), "input.txt"),
     ) -> None:
         self._seq_len = sequence_length
+        self._path = path
         enc = tiktoken.get_encoding("gpt2")
         with open(path, "r", encoding="utf-8") as fh:
             self._tokens = np.array(enc.encode(fh.read()), dtype=np.int32)
+
+    def __repr__(self) -> str:
+        return f"InputTxtSource(sequence_length={self._seq_len}, path={self._path!r})"
 
     def __len__(self) -> int:
         return max(0, (len(self._tokens) - 1) // self._seq_len)
@@ -249,11 +256,15 @@ class HellaSwagSource:
     def __init__(self, split: str = "val") -> None:
         import json
 
+        self._split = split
         _download_hellaswag(split)
         path = os.path.join(_HELLASWAG_DATA_DIR, f"hellaswag_{split}.jsonl")
         with open(path, "r") as fh:
             self._examples = [json.loads(line) for line in fh]
         self._enc = tiktoken.get_encoding("gpt2")
+
+    def __repr__(self) -> str:
+        return f"HellaSwagSource(split={self._split!r})"
 
     def __len__(self) -> int:
         return len(self._examples)
@@ -389,12 +400,7 @@ def create_val_loader(cfg: "ConfigDict") -> grain.DataLoader | None:
     -------
     A :class:`~grain.python.DataLoader` or ``None``.
     """
-    if cfg.dataset == "input_txt":
-        return None
-
-    source = EduFinewebShardSource(
-        sequence_length=cfg.sequence_length, split="val"
-    )
+    source = EduFinewebShardSource(sequence_length=cfg.sequence_length, split="val")
     local_bs = _local_batch_size(cfg)
 
     sampler = grain.IndexSampler(
