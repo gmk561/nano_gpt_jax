@@ -51,7 +51,7 @@ echo "Setting up Python environment..."
 VENV_DIR="$REPO_DIR/.venv"
 if [ ! -d "$VENV_DIR" ]; then
     echo "Creating virtual environment at $VENV_DIR (with --system-site-packages)..."
-    sudo -u "$TARGET_USER" python -m venv --system-site-packages "$VENV_DIR"
+    sudo -u "$TARGET_USER" python3 -m venv --system-site-packages "$VENV_DIR"
 fi
 
 PYTHON_CMD="$VENV_DIR/bin/python"
