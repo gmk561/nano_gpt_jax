@@ -73,6 +73,35 @@ _HELLASWAG_URLS: dict[str, str] = {
     "test": "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_test.jsonl",
 }
 
+# ── Tokenizers ─────────────────────────────────────────────────────────────────
+
+
+class CharTokenizer:
+    """Simple character-level tokenizer.
+
+    Builds a vocabulary from the unique characters in *text* and provides
+    :meth:`encode` / :meth:`decode` round-trips.  Useful for small toy datasets
+    (e.g. ``input.txt``); the main training pipeline uses the GPT-2 tiktoken
+    encoder instead.
+
+    Parameters
+    ----------
+    text:
+        Full corpus string used to derive the vocabulary.
+    """
+
+    def __init__(self, text: str):
+        chars = sorted(set(text))
+        self.vocab_size = len(chars)
+        self.stoi = {ch: i for i, ch in enumerate(chars)}  # char -> int
+        self.itos = {i: ch for i, ch in enumerate(chars)}  # int -> char
+
+    def encode(self, text: str) -> list[int]:
+        return [self.stoi[ch] for ch in text]
+
+    def decode(self, tokens: list[int]) -> str:
+        return "".join(self.itos[i] for i in tokens)
+
 
 # ── EduFineweb shard data source ───────────────────────────────────────────────
 
