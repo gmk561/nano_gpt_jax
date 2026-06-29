@@ -50,6 +50,9 @@ def get_config() -> ConfigDict:
     cfg.model.param_dtype = jnp.bfloat16 if cfg.apply_dtype_policy else jnp.float32
     cfg.model.compute_dtype = jnp.bfloat16 if cfg.apply_dtype_policy else jnp.float32
     cfg.model.accum_dtype = jnp.float32
+    # Attention implementation: "flash" | "flax" | "classical"
+    # See attention.py / AttentionType for details.
+    cfg.model.attention_type = "flash"  # cuDNN on GPU, XLA fallback on CPU
     return cfg
 
 
@@ -72,5 +75,9 @@ def get_cpu_test_config() -> ConfigDict:
     cfg.model.n_embd = 16
 
     cfg.dataset = "input_txt"
+
+    # Use the Flax reference implementation on CPU so there is a known-good
+    # baseline to compare against when developing custom attention.
+    cfg.model.attention_type = "flax"
 
     return cfg

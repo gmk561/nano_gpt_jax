@@ -2,7 +2,8 @@
 GPT model architecture for nano-GPT JAX.
 
 Provides the GPT transformer model built with Flax NNX, along with
-attention helpers, dtype utilities, and compiled train/val step functions.
+dtype utilities and compiled train/val step functions.
+Attention implementations live in :mod:`attention`.
 
 Classes
 -------
@@ -17,8 +18,7 @@ Functions
 ---------
 is_cudnn_available()
     Returns True if cuDNN is available for flash-attention dispatch.
-flash_attention_fn()
-    Wrapper around jax.nn.dot_product_attention with cuDNN auto-detection.
+    See :mod:`attention`.
 cast_params()
     Cast all floating-point parameters in an NNX module to a target dtype.
 apply_dtype_policy()
@@ -37,7 +37,6 @@ align_acc_step()
 
 from __future__ import annotations
 
-import functools
 from typing import TYPE_CHECKING
 
 import jax
@@ -45,39 +44,10 @@ import jax.numpy as jnp
 import optax
 from flax import nnx
 
+from attention import build_attention_module, is_cudnn_available  # noqa: F401
+
 if TYPE_CHECKING:
     from ml_collections import ConfigDict
-
-
-# ── Attention helpers ──────────────────────────────────────────────────────────
-
-
-def is_cudnn_available() -> bool:
-    """Return True if a cuDNN runtime is accessible via JAX."""
-    try:
-        from jax._src.lib import cuda_versions
-
-        return (
-            cuda_versions is not None and cuda_versions.cudnn_get_version() is not None
-        )
-    except (ImportError, AttributeError, RuntimeError):
-        return False
-
-
-def flash_attention_fn(
-    query, key, value, bias=None, mask=None, is_causal=True, **kwargs
-):
-    """Dot-product attention using cuDNN flash-attention when available."""
-    impl = "cudnn" if is_cudnn_available() else "xla"
-    return jax.nn.dot_product_attention(
-        query,
-        key,
-        value,
-        bias=bias,
-        mask=mask if not is_causal else None,
-        is_causal=is_causal,
-        implementation=impl,
-    )
 
 
 # ── Model modules ──────────────────────────────────────────────────────────────
@@ -117,27 +87,9 @@ class MLP(nnx.Module):
 class Block(nnx.Module):
     def __init__(self, config: "ConfigDict", rngs: nnx.Rngs):
         self.config = config
-        init_fn = nnx.initializers.normal(stddev=0.02)
-        # Sharding: all (None,...) = replicated for data parallelism.
-        # For model parallelism later: QKV kernel -> (None, None, 'model'),
-        #   out kernel -> (None, 'model', None).
-        self.mha = nnx.MultiHeadAttention(
-            num_heads=config.n_head,
-            in_features=config.n_embd,
-            qkv_features=config.n_embd,  # total dim; Flax splits by num_heads internally
-            rngs=rngs,
-            decode=False,
-            dtype=config.compute_dtype,
-            kernel_init=init_fn,
-            kernel_metadata={"out_sharding": (None, None, None)},
-            out_kernel_init=init_fn,
-            out_kernel_metadata={"out_sharding": (None, None, None)},
-            bias_init=nnx.initializers.zeros_init(),
-            bias_metadata={"out_sharding": (None,)},
-            out_bias_init=nnx.initializers.zeros_init(),
-            out_bias_metadata={"out_sharding": (None,)},
-            attention_fn=functools.partial(flash_attention_fn, is_causal=True),
-        )
+        # Attention module is selected by config.attention_type.
+        # See attention.py / AttentionType for available options.
+        self.mha = build_attention_module(config, rngs)
         self.mlp = MLP(config, rngs=rngs)
         self.layernorm_1 = nnx.LayerNorm(config.n_embd, rngs=rngs)
         self.layernorm_2 = nnx.LayerNorm(config.n_embd, rngs=rngs)
@@ -189,8 +141,12 @@ class GPT(nnx.Module):
             # MLP's second linear (projects back into residual stream)
             if isinstance(parent, MLP) and attr_name == "linear_2":
                 return True
-            # MultiHeadAttention's output projection
+            # nnx.MultiHeadAttention output projection (FLAX / FLASH types)
             if isinstance(parent, nnx.MultiHeadAttention) and attr_name == "out":
+                return True
+            # ClassicalMultiHeadAttention output projection (CLASSICAL type)
+            from attention import ClassicalMultiHeadAttention
+            if isinstance(parent, ClassicalMultiHeadAttention) and attr_name == "out_proj":
                 return True
             return False
 

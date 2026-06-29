@@ -33,6 +33,7 @@ from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from attention import is_cudnn_available
 from checkpoint import build_checkpoint_manager, restore_from_checkpoint, save_checkpoint
 from config import get_config, get_cpu_test_config
 from data import GPT2_VOCAB_SIZE, create_train_loader, create_val_loader
@@ -41,7 +42,6 @@ from model import (
     align_acc_step,
     apply_dtype_policy,
     dtype_report,
-    is_cudnn_available,
     train_step,
     val_step,
 )
