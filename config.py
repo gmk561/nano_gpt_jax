@@ -55,7 +55,7 @@ def get_config() -> ConfigDict:
     # Attention implementation: "flash" | "flax" | "classical"
     # See attention.py / AttentionType for details.
     cfg.model.attention_type = "flash"  # cuDNN on GPU, XLA fallback on CPU
-    cfg.use_attention_bias = True
+    cfg.model.use_attention_bias = True
 
     return cfg
 
@@ -94,12 +94,12 @@ def get_mem_eff_config() -> ConfigDict:
     ``attention_type`` to ``"mem_eff"``.  Chunk sizes are set to 64 tokens
     by default — tweak them to trade compilation time for memory savings.
     """
-    cfg = get_cpu_test_config()
+    cfg = get_config()
     cfg.model.attention_type = "mem_eff"
 
     # How many query / key tokens to process per chunk.
     # Smaller values → less peak memory, more XLA loop iterations.
-    cfg.model.query_chunk_size = 64
-    cfg.model.key_chunk_size = 64
+    cfg.model.query_chunk_size = 512
+    cfg.model.key_chunk_size = 512
 
     return cfg

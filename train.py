@@ -35,7 +35,7 @@ from jax.sharding import PartitionSpec as P
 
 from attention import is_cudnn_available
 from checkpoint import build_checkpoint_manager, restore_from_checkpoint, save_checkpoint
-from config import get_config, get_cpu_test_config
+from config import get_config, get_cpu_test_config, get_mem_eff_config
 from data import GPT2_VOCAB_SIZE, create_train_loader, create_val_loader
 from model import (
     GPT,
@@ -46,9 +46,6 @@ from model import (
     val_step,
 )
 
-print("jax.device_count():", jax.device_count())
-
-nnx.use_eager_sharding(True)
 
 # ── W&B setup ─────────────────────────────────────────────────────────────────
 
@@ -92,11 +89,15 @@ _accelerator_backends = {"gpu", "tpu"}
 
 if __name__ == "__main__":
     # ── Training setup ──────────────────────────────────────────────────────────
+    print("jax.device_count():", jax.device_count())
+    nnx.use_eager_sharding(True)
+
     _has_accelerator = any(d.platform in _accelerator_backends for d in jax.devices())
     print(f"Training with accelerator: {_has_accelerator}")
     print("Is cudnn available? ", is_cudnn_available())
 
-    cfg = get_config() if _has_accelerator else get_cpu_test_config()
+    # cfg = get_config() if _has_accelerator else get_cpu_test_config()
+    cfg = get_mem_eff_config() if _has_accelerator else get_cpu_test_config()
     # 2D mesh: ('data', 'model'). For now model=1; later change to (dp, mp) for tensor parallelism.
     mesh = jax.make_mesh((cfg.num_devices, 1), ("data", "model"))
 

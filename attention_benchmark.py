@@ -63,7 +63,7 @@ def _make_flax_module(n_embd, n_head, seed=0, attention_fn=None):
         qkv_features=n_embd,
         rngs=nnx.Rngs(seed),
         decode=False,
-        dtype=jnp.float32,
+        dtype=jnp.bfloat16,
         kernel_init=nnx.initializers.normal(stddev=0.02),
         out_kernel_init=nnx.initializers.normal(stddev=0.02),
         bias_init=nnx.initializers.zeros_init(),
@@ -109,7 +109,7 @@ def _memory_analysis(module: nnx.Module, x_shape: tuple) -> MemStats:
     state_abstract = jax.tree.map(
         lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), state
     )
-    x_abstract = jax.ShapeDtypeStruct(x_shape, jnp.float32)
+    x_abstract = jax.ShapeDtypeStruct(x_shape, jnp.bfloat16)
 
     @jax.jit
     def forward(state, x):
@@ -140,7 +140,7 @@ def _flop_analysis(module: nnx.Module, x_shape: tuple) -> FlopsStats:
     state_abstract = jax.tree.map(
         lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), state
     )
-    x_abstract = jax.ShapeDtypeStruct(x_shape, jnp.float32)
+    x_abstract = jax.ShapeDtypeStruct(x_shape, jnp.bfloat16)
 
     @jax.jit
     def forward(state, x):
@@ -286,8 +286,8 @@ def main():
     if "mem_eff" in args.impl:
         modules["MemoryEfficientAttention (chunked)"] = _make_module(
             MemoryEfficientAttention, E, H,
-            query_chunk_size=min(T, 16),
-            key_chunk_size=min(T, 16),
+            query_chunk_size=min(T, 1024),
+            key_chunk_size=min(T, 1024),
         )
 
     if "flax" in args.impl:
