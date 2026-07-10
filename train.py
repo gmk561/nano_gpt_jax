@@ -172,18 +172,7 @@ if __name__ == "__main__":
         run = wandb.init(
             project="nano-gpt-jax",
             mode=os.environ.get("WANDB_MODE", "online"),
-            config={
-                "n_layer": cfg.model.n_layer,
-                "n_head": cfg.model.n_head,
-                "n_embd": cfg.model.n_embd,
-                "block_size": cfg.model.block_size,
-                "vocab_size": cfg.model.vocab_size,
-                "batch_size": cfg.batch_size,
-                "sequence_length": cfg.sequence_length,
-                "learning_rate": learning_rate,
-                "max_steps": max_steps,
-                "dtype_policy": cfg.apply_dtype_policy,
-            },
+            config=cfg.to_dict(),
         )
 
         t0 = time.time()

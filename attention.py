@@ -26,6 +26,8 @@ Configure via ``cfg.model.attention_type`` in ``config.py``.
 
 from __future__ import annotations
 
+from flax.nnx.nn.linear import default_bias_init
+
 import functools
 import math
 from enum import Enum
@@ -38,6 +40,8 @@ from flax import nnx
 if TYPE_CHECKING:
     from ml_collections import ConfigDict
 
+
+Array = jax.Array
 
 # ── Enum ───────────────────────────────────────────────────────────────────────
 
@@ -56,11 +60,15 @@ class AttentionType(str, Enum):
         Production: ``nnx.MultiHeadAttention`` + JAX flash/XLA kernel.
     ``"classical"``
         Exercise: explicit SDPA from "Attention is All You Need".
+    ``"mem_eff"``
+        Chunked online-softmax (Rabe & Staats 2022) — trades peak memory for
+        constant-memory attention via ``jax.lax.scan`` + ``jax.lax.map``.
     """
 
     FLAX = "flax"
     FLASH = "flash"
-    CLASSICAL = "classical"
+    CLASSICAL = "classical"  # reimplementation of Attention is all you need paper.
+    MEM_EFF = "mem_eff"
 
 
 # ── cuDNN detection ────────────────────────────────────────────────────────────
@@ -102,116 +110,236 @@ def _flash_attention_kernel(
     )
 
 
-# ── Classical multi-head attention ─────────────────────────────────────────────
-
-
-class ClassicalMultiHeadAttention(nnx.Module):
-    """Multi-head attention from "Attention is All You Need" (Vaswani et al., 2017).
-
-    Implements scaled dot-product attention explicitly without relying on any
-    JAX-level attention kernel optimisation.  Every operation is written out
-    so the implementation can serve as a readable, step-by-step reference:
-
-    .. code-block:: text
-
-        Q = x W_Q,  K = x W_K,  V = x W_V     # linear projections
-        scores = Q K^T / sqrt(d_k)              # scale
-        scores = masked_fill(scores, mask==0, -inf)  # causal mask
-        weights = softmax(scores, dim=-1)       # attention weights
-        context = weights V                     # aggregate values
-        out = context W_O                       # output projection
-
-    Parameters
-    ----------
-    config:
-        Model config; must provide ``n_head``, ``n_embd``, ``compute_dtype``.
-    rngs:
-        NNX PRNG key bundle.
-    """
-
-    def __init__(self, config: "ConfigDict", rngs: nnx.Rngs) -> None:
-        if config.n_embd % config.n_head != 0:
-            raise ValueError(
-                f"n_embd ({config.n_embd}) must be divisible by n_head ({config.n_head})"
-            )
-        self.n_head = config.n_head
-        self.head_dim = config.n_embd // config.n_head
-
-        init_fn = nnx.initializers.normal(stddev=0.02)
-        zeros = nnx.initializers.zeros_init()
-
-        def _linear(features_in, features_out):
-            return nnx.Linear(
-                features_in,
-                features_out,
-                rngs=rngs,
-                dtype=config.compute_dtype,
-                kernel_init=init_fn,
-                kernel_metadata={"out_sharding": (None, None)},
-                bias_init=zeros,
-                bias_metadata={"out_sharding": (None,)},
-            )
-
-        n = config.n_embd
-        self.q_proj = _linear(n, n)
-        self.k_proj = _linear(n, n)
-        self.v_proj = _linear(n, n)
-        self.out_proj = _linear(n, n)
-
-    def __call__(
+# Implementation of the classical Attention is all you need paper: https://arxiv.org/abs/1706.03762
+class MultiHeadAttention(nnx.Module):
+    def __init__(
         self,
-        inputs_q: jax.Array,
-        mask: jax.Array | None = None,
-    ) -> jax.Array:
-        """Forward pass.
+        n_embd: int,
+        num_heads: int,
+        use_bias: bool,
+        kernel_init: nnx.initializers.Initializer = nnx.initializers.lecun_normal(),
+        bias_init: nnx.initializers.Initializer = nnx.initializers.zeros_init(),
+        *,
+        rngs: nnx.Rngs,
+    ) -> None:
+        if n_embd % num_heads != 0:
+            raise ValueError(
+                f"Incompatible dimensions: `n_embd` ({n_embd}) must be divisible "
+                f"by `num_heads` ({num_heads}) for the Flax linear layer weights to reshape correctly."
+            )
+
+        self.n_embd = n_embd
+        self.use_bias = use_bias
+        self.num_heads = num_heads
+        head_dim = n_embd // num_heads
+        self.head_dim = head_dim
+
+        self.scale = math.sqrt(self.head_dim)
+
+        linear = functools.partial(
+            nnx.LinearGeneral,
+            in_features=n_embd,
+            out_features=(num_heads, head_dim),
+            use_bias=use_bias,
+            kernel_init=kernel_init,
+            bias_init=bias_init,
+        )
+
+        self.query = linear(rngs=rngs)
+        self.key = linear(rngs=rngs)
+        self.value = linear(rngs=rngs)
+
+        self.out = nnx.LinearGeneral(
+            in_features=(num_heads, head_dim),
+            out_features=n_embd,
+            use_bias=use_bias,
+            kernel_init=kernel_init,
+            bias_init=bias_init,
+            rngs=rngs,
+            axis=(-2, -1),
+        )
+
+    def softmax(self, qk):
+        max_element = jnp.max(qk, axis=-1, keepdims=True)
+        qkm = qk - max_element
+        unnormalized = jnp.exp(qkm / self.scale)
+
+        sm = unnormalized / jnp.sum(unnormalized, axis=-1, keepdims=True)
+        return sm
+
+    def __call__(self, x, mask=None):
+        B, T, D = x.shape
+
+        q, k, v = (self.query(x), self.key(x), self.value(x))  # (B, T, D)
+        qk = jnp.einsum("...qhd,...khd->...hqk", q, k)
+        if mask is not None:
+            qk = jnp.where(mask, qk, -jnp.inf)
+        sm = self.softmax(qk)  # (B, H, T, T)
+        att = jnp.einsum("...hqk,...khd->...qhd", sm, v)  # (B, T, H, D)
+
+        out = self.out(att)  # (B, T, D)
+
+        return out
+
+
+class MemoryEfficientAttention(nnx.Module):
+    # Implementation of https://arxiv.org/pdf/2112.05682.
+
+    def __init__(
+        self,
+        n_embd,
+        num_heads,
+        use_bias,
+        query_chunk_size: int = 64,
+        key_chunk_size: int = 64,
+        kernel_init: nnx.initializers.Initializer = nnx.initializers.lecun_normal(),
+        bias_init: nnx.initializers.Initializer = nnx.initializers.zeros_init(),
+        *,
+        rngs: nnx.Rngs,
+    ) -> None:
+        if n_embd % num_heads != 0:
+            raise ValueError(
+                f"Incompatible dimensions: `n_embd` ({n_embd}) must be divisible "
+                f"by `num_heads` ({num_heads}) for the Flax linear layer weights to reshape correctly."
+            )
+
+        self.n_embd = n_embd
+        self.use_bias = use_bias
+        self.num_heads = num_heads
+        head_dim = n_embd // num_heads
+        self.head_dim = head_dim
+        self.query_chunk_size = query_chunk_size
+        self.key_chunk_size = key_chunk_size
+
+        self.scale = math.sqrt(self.head_dim)
+
+        linear = functools.partial(
+            nnx.LinearGeneral,
+            in_features=n_embd,
+            out_features=(num_heads, head_dim),
+            use_bias=use_bias,
+            kernel_init=kernel_init,
+            bias_init=bias_init,
+        )
+
+        self.query = linear(rngs=rngs)
+        self.key = linear(rngs=rngs)
+        self.value = linear(rngs=rngs)
+
+        self.out = nnx.LinearGeneral(
+            in_features=(num_heads, head_dim),
+            out_features=n_embd,
+            use_bias=use_bias,
+            kernel_init=kernel_init,
+            bias_init=bias_init,
+            rngs=rngs,
+            axis=(-2, -1),
+        )
+
+    def _chunk_attention(self, query, keys, values, B, H, D, T, mask=None):
+        """Scan over all key/value chunks for one query chunk and return the
+        normalised attention output.
 
         Parameters
         ----------
-        inputs_q:
-            Input tensor ``(batch, seq_len, n_embd)``.
-        mask:
-            Boolean causal mask ``(1, 1, seq_len, seq_len)``.
-            ``True`` = attend, ``False`` = block (filled with ``-inf`` before
-            softmax).  When ``None``, full (non-causal) attention is computed.
-
-        Returns
-        -------
-        jax.Array
-            Output ``(batch, seq_len, n_embd)``.
+        query_chunk : (B, chunk_size, H, D)
+        k, v        : (B, T, H, D)
+        B, H, D, T  : int — static dimension sizes
         """
-        B, T, _ = inputs_q.shape
 
-        # ── 1. Linear projections ──────────────────────────────────────────────
-        q = self.q_proj(inputs_q)   # (B, T, n_embd)
-        k = self.k_proj(inputs_q)
-        v = self.v_proj(inputs_q)
+        @functools.partial(jax.checkpoint, prevent_cse=False)
+        def chunk_scanner(idx):
+            sliced_keys = jax.lax.dynamic_slice(
+                keys,
+                start_indices=(0, idx * self.key_chunk_size, 0, 0),
+                slice_sizes=(B, self.key_chunk_size, H, D),
+            )  # (B, C, H, D)
+            sliced_values = jax.lax.dynamic_slice(
+                values,
+                start_indices=(0, idx * self.key_chunk_size, 0, 0),
+                slice_sizes=(B, self.key_chunk_size, H, D),
+            )  # (B, C, H, D)
 
-        # ── 2. Split into heads → (B, n_head, T, head_dim) ────────────────────
-        def split_heads(x: jax.Array) -> jax.Array:
-            return x.reshape(B, T, self.n_head, self.head_dim).transpose(0, 2, 1, 3)
+            attention_weights = jnp.einsum(
+                "bchd,bkhd->bhck",
+                query,
+                sliced_keys,
+            )  # (B, H, C, C)
+            attention_weights = attention_weights / self.scale  # (B, H, C, C)
 
-        q, k, v = split_heads(q), split_heads(k), split_heads(v)
+            if mask is not None:
+                sliced_mask = jax.lax.dynamic_slice(
+                    mask,
+                    start_indices=(0, 0, 0, idx * self.key_chunk_size),
+                    slice_sizes=(1, 1, self.query_chunk_size, self.key_chunk_size),
+                )
+                attention_weights = jnp.where(sliced_mask, attention_weights, -jnp.inf)
 
-        # ── 3. Scaled dot-product attention ────────────────────────────────────
-        # QK^T / sqrt(d_k)  →  (B, n_head, T, T)
-        scale = math.sqrt(self.head_dim)
-        attn_logits = jnp.matmul(q, k.transpose(0, 1, 3, 2)) / scale
+            max_att_weight = jnp.max(
+                attention_weights, axis=-1, keepdims=True
+            )  # (B, H, C, 1)
 
-        # Apply causal mask: blocked positions get -inf so softmax → 0
-        if mask is not None:
-            attn_logits = jnp.where(
-                mask, attn_logits, jnp.finfo(attn_logits.dtype).min
+            max_att_weight = jnp.maximum(max_att_weight, -1e9)
+            attention_weights = attention_weights - max_att_weight
+            # Clamp it so it can never drop below a safe finite value
+            # As -inf - -inf = NaN
+
+            exp_att_weights = jnp.exp(attention_weights)  # (B, H, C, C)
+            exp_att_values = jnp.einsum(
+                "bhqk,bkhd->bhqd", exp_att_weights, sliced_values
+            )  # (B, C, H, D)
+
+            return max_att_weight, jnp.sum(exp_att_weights, axis=-1), exp_att_values
+
+        max_att_weights, exp_attention_weights, exp_att_values = jax.lax.map(
+            chunk_scanner, jnp.arange(math.ceil(T / self.key_chunk_size))
+        )
+
+        global_max_att_weight = jnp.max(max_att_weights, axis=0)
+        exp_max_att_diff = jnp.exp(
+            max_att_weights - global_max_att_weight
+        )  # (N_K, B, H, C, 1)
+
+        exp_att_values = jnp.sum(
+            exp_att_values * exp_max_att_diff, axis=0, keepdims=False
+        )  # (B,T,H,D)
+
+        exp_attention_weights = jnp.sum(
+            exp_attention_weights * exp_max_att_diff[..., 0], axis=0, keepdims=False
+        )  # (B,T,H,D)
+
+        return exp_att_values / exp_attention_weights[..., None]
+
+    def __call__(self, x, mask=None):
+        q, k, v = self.query(x), self.key(x), self.value(x)
+
+        B, T, H, D = q.shape
+
+        def _query_chunk_processor(idx: int, _):
+            query_chunk = jax.lax.dynamic_slice(
+                q,
+                start_indices=(0, idx * self.query_chunk_size, 0, 0),
+                slice_sizes=(B, self.query_chunk_size, H, D),
             )
 
-        attn_weights = jax.nn.softmax(attn_logits, axis=-1)  # (B, n_head, T, T)
-        context = jnp.matmul(attn_weights, v)                # (B, n_head, T, head_dim)
+            mask_chunk = None
+            if mask is not None:
+                mask_chunk = jax.lax.dynamic_slice(
+                    mask,
+                    start_indices=(0, 0, idx * self.query_chunk_size, 0),
+                    slice_sizes=(1, 1, self.query_chunk_size, T),
+                )
 
-        # ── 4. Merge heads and project ─────────────────────────────────────────
-        context = context.transpose(0, 2, 1, 3).reshape(B, T, -1)  # (B, T, n_embd)
-        return self.out_proj(context)
+            return idx + 1, self._chunk_attention(
+                query_chunk, k, v, B, H, D, T, mask=mask_chunk
+            )
 
+        num_chunks = int(math.ceil(T / self.query_chunk_size))
+        _, att = jax.lax.scan(
+            _query_chunk_processor, init=0, xs=None, length=num_chunks
+        )  # (num_chunks, B, C, H, D)
 
-# ── Factory ────────────────────────────────────────────────────────────────────
+        return self.out(att.transpose(1, 0, 3, 2, 4).reshape(B, T, H, D))
 
 
 def build_attention_module(config: "ConfigDict", rngs: nnx.Rngs) -> nnx.Module:
@@ -274,7 +402,29 @@ def build_attention_module(config: "ConfigDict", rngs: nnx.Rngs) -> nnx.Module:
         )
 
     if attn_type == AttentionType.CLASSICAL:
-        return ClassicalMultiHeadAttention(config, rngs)
+        return MultiHeadAttention(
+            n_embd=config.n_embd,
+            num_heads=config.n_head,
+            use_bias=config.use_attention_bias,
+            kernel_init=init_fn,
+            bias_init=zeros,
+            rngs=rngs,
+        )
+
+    if attn_type == AttentionType.MEM_EFF:
+        # Chunk sizes default to 64; can be overridden via config.
+        query_chunk_size = getattr(config, "query_chunk_size", 64)
+        key_chunk_size = getattr(config, "key_chunk_size", 64)
+        return MemoryEfficientAttention(
+            n_embd=config.n_embd,
+            num_heads=config.n_head,
+            use_bias=config.use_attention_bias,
+            query_chunk_size=query_chunk_size,
+            key_chunk_size=key_chunk_size,
+            kernel_init=init_fn,
+            bias_init=zeros,
+            rngs=rngs,
+        )
 
     raise ValueError(
         f"Unknown attention_type {config.attention_type!r}. "

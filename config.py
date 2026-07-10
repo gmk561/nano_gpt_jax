@@ -1,9 +1,10 @@
 """
 Training configuration for nano-GPT JAX.
 
-Provides two configs:
+Provides three configs:
 - :func:`get_config`: full GPU training configuration.
 - :func:`get_cpu_test_config`: lightweight CPU-only configuration for quick iteration.
+- :func:`get_mem_eff_config`: like ``get_cpu_test_config`` but uses :class:`~attention.MemoryEfficientAttention`.
 """
 
 import os
@@ -50,9 +51,12 @@ def get_config() -> ConfigDict:
     cfg.model.param_dtype = jnp.bfloat16 if cfg.apply_dtype_policy else jnp.float32
     cfg.model.compute_dtype = jnp.bfloat16 if cfg.apply_dtype_policy else jnp.float32
     cfg.model.accum_dtype = jnp.float32
+
     # Attention implementation: "flash" | "flax" | "classical"
     # See attention.py / AttentionType for details.
     cfg.model.attention_type = "flash"  # cuDNN on GPU, XLA fallback on CPU
+    cfg.use_attention_bias = True
+
     return cfg
 
 
@@ -79,5 +83,23 @@ def get_cpu_test_config() -> ConfigDict:
     # Use the Flax reference implementation on CPU so there is a known-good
     # baseline to compare against when developing custom attention.
     cfg.model.attention_type = "flax"
+
+    return cfg
+
+
+def get_mem_eff_config() -> ConfigDict:
+    """CPU config that uses :class:`~attention.MemoryEfficientAttention`.
+
+    Inherits all settings from :func:`get_cpu_test_config` and overrides
+    ``attention_type`` to ``"mem_eff"``.  Chunk sizes are set to 64 tokens
+    by default — tweak them to trade compilation time for memory savings.
+    """
+    cfg = get_cpu_test_config()
+    cfg.model.attention_type = "mem_eff"
+
+    # How many query / key tokens to process per chunk.
+    # Smaller values → less peak memory, more XLA loop iterations.
+    cfg.model.query_chunk_size = 64
+    cfg.model.key_chunk_size = 64
 
     return cfg
