@@ -108,11 +108,12 @@ class RoPE(nnx.Module):
         return rotated.reshape(x.shape)
 
     def __call__(self, x: jnp.ndarray, position_axis: int = 1):
+        input_dtype = x.dtype
         T = x.shape[position_axis]
         D = x.shape[-1]
 
-        rope_cos = self.cos_table[:T, :D]
-        rope_sin = self.sin_table[:T, :D]
+        rope_cos = self.cos_table[:T, :D].astype(input_dtype)
+        rope_sin = self.sin_table[:T, :D].astype(input_dtype)
 
         broadcast_shape = [1] * x.ndim
         broadcast_shape[position_axis] = T

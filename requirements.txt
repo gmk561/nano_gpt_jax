@@ -1,6 +1,6 @@
 numpy<2
 jax[cuda12]
-flax>=0.12.1
+flax
 optax
 tiktoken
 wandb

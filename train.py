@@ -142,12 +142,24 @@ else:
     import wandb  # type: ignore[no-redef]
 
 
-# ── Constants ──────────────────────────────────────────────────────────────────
 
 _accelerator_backends = {"gpu", "tpu"}
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+def trapezoidal_schedule(config):
+    warmup_schedule = optax.linear_schedule(
+        init_value=0.0, end_value=config.learning_rate, transition_steps=config.warmup_steps)
+    plateau_schedule = optax.constant_schedule(
+        value=config.learning_rate)
+    decay_schedule = optax.linear_schedule(
+        init_value=config.learning_rate, transition_steps=config.warmup_steps, end_value=0.0)
+
+    return optax.join_schedules(
+        schedules=[warmup_schedule, plateau_schedule, decay_schedule], 
+        boundaries=[config.warmup_steps, config.max_steps - config.warmup_steps]
+    )
+
+
 
 if __name__ == "__main__":
     args = _parse_args()
@@ -187,13 +199,14 @@ if __name__ == "__main__":
 
         dtype_report(model)
 
-        schedule = optax.warmup_cosine_decay_schedule(
-            init_value=0.0,
-            peak_value=cfg.learning_rate,
-            warmup_steps=cfg.warmup_steps,
-            decay_steps=cfg.max_steps - cfg.warmup_steps,
-            end_value=cfg.learning_rate * cfg.lr_end_ratio,
-        )
+        # schedule = optax.warmup_cosine_decay_schedule(
+        #     init_value=0.0,
+        #     peak_value=cfg.learning_rate,
+        #     warmup_steps=cfg.warmup_steps,
+        #     decay_steps=cfg.max_steps - cfg.warmup_steps,
+        #     end_value=cfg.learning_rate * cfg.lr_end_ratio,
+        # )
+        schedule = trapezoidal_schedule(cfg)
 
         def decay_mask(params):
             return jax.tree_util.tree_map(lambda p: p.ndim >= 2, params)
@@ -332,13 +345,13 @@ if __name__ == "__main__":
                         "loss": loss.item(),
                         "step_time_ms": dt * 1000,
                         "tokens_per_sec": tokens_per_sec,
-                        "learning_rate": schedule(optimizer.step[...]).item(),
+                        "learning_rate": schedule(eff_step).item(),
                         "total_tokens": total_tokens,
                     },
                     step=eff_step,
                 )
                 print(
-                    f"step {eff_step:4d} | loss {loss:.4f} | lr: {schedule(optimizer.step[...]):.4f} | time {dt * 1000:.2f} ms | tokens/sec {tokens_per_sec:.2f} | tokens {total_tokens}"
+                    f"step {eff_step:4d} | loss {loss:.4f} | lr: {schedule(eff_step):.4f} | time {dt * 1000:.2f} ms | tokens/sec {tokens_per_sec:.2f} | tokens {total_tokens}"
                 )
                 t0 = time.time()
 

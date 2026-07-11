@@ -29,9 +29,12 @@ def get_config() -> ConfigDict:
     cfg.dataset = "edu_fineweb"  # "input_txt" or "edu_fineweb"
     cfg.val_check_steps = 100  # evaluate validation loss every 100 steps
     cfg.val_max_steps = 50  # max number of batches to use for validation
-    cfg.max_steps = 10_000  # total training steps
-    cfg.warmup_steps = 715
-    cfg.learning_rate = 6e-4
+    cfg.max_steps = 1000  # total training steps
+    cfg.warmup_steps = 100
+    # cfg.learning_rate = 6e-4
+    # cfg.learning_rate = 1e-3
+    # cfg.learning_rate = 5e-3
+    cfg.learning_rate = 1e-2
     cfg.lr_end_ratio = 0.1  # end_value = learning_rate * lr_end_ratio
     cfg.seed = 0
 
@@ -39,7 +42,7 @@ def get_config() -> ConfigDict:
     cfg.ckpt_dir_name = "checkpoints"
     cfg.ckpt_dir = os.path.join(os.path.dirname(__file__), cfg.ckpt_dir_name)
     cfg.ckpt_every_steps = (
-        cfg.val_check_steps * 1
+        cfg.val_check_steps * 1000
     )  # save every N effective training steps; best aligned with validation checks
     cfg.ckpt_max_to_keep = 3  # keep N most recent + best val_loss
     cfg.resume_ckpt = None  # step number, "latest", or None to start fresh
