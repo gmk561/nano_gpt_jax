@@ -31,14 +31,11 @@ from flax.nnx.nn.linear import default_bias_init
 import functools
 import math
 from enum import Enum
-from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
-
-if TYPE_CHECKING:
-    from ml_collections import ConfigDict
+from ml_collections import ConfigDict
 
 
 Array = jax.Array
@@ -342,7 +339,7 @@ class MemoryEfficientAttention(nnx.Module):
         return self.out(att.transpose(1, 0, 3, 2, 4).reshape(B, T, H, D))
 
 
-def build_attention_module(config: "ConfigDict", rngs: nnx.Rngs) -> nnx.Module:
+def build_attention_module(config: ConfigDict, rngs: nnx.Rngs) -> nnx.Module:
     """Return the attention module specified by ``config.attention_type``.
 
     Parameters

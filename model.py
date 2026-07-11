@@ -37,17 +37,20 @@ align_acc_step()
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
 import optax
 from flax import nnx
+from ml_collections import ConfigDict
 
-from attention import build_attention_module, is_cudnn_available, MultiHeadAttention, MemoryEfficientAttention  # noqa: F401
+from attention import (
+    build_attention_module,
+    is_cudnn_available,
+    MultiHeadAttention,
+    MemoryEfficientAttention,
+)  # noqa: F401
 
-if TYPE_CHECKING:
-    from ml_collections import ConfigDict
 
 
 # ── Model modules ──────────────────────────────────────────────────────────────
@@ -85,7 +88,7 @@ class MLP(nnx.Module):
 
 
 class Block(nnx.Module):
-    def __init__(self, config: "ConfigDict", rngs: nnx.Rngs):
+    def __init__(self, config: ConfigDict, rngs: nnx.Rngs):
         self.config = config
         # Attention module is selected by config.attention_type.
         # See attention.py / AttentionType for available options.
@@ -102,8 +105,17 @@ class Block(nnx.Module):
         return x
 
 
+class RoPE(nnx.Module):
+
+    def __init__(self, config: ConfigDict, rngs: nnx.Rngs):
+        self.config = config
+
+    def __call__(self, x: jnp.ndarray):
+        return x
+
+
 class GPT(nnx.Module):
-    def __init__(self, config: "ConfigDict", rngs: nnx.Rngs):
+    def __init__(self, config: ConfigDict, rngs: nnx.Rngs):
         self.config = config
         # Sharding: (None, None) = replicated for data parallelism.
         # For model parallelism later: change to (None, 'model').

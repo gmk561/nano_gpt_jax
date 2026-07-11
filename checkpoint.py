@@ -27,12 +27,11 @@ from typing import TYPE_CHECKING
 
 import orbax.checkpoint as ocp
 from flax import nnx
+from ml_collections import ConfigDict
 
 from data import get_iter_state, restore_iter_state
 
 if TYPE_CHECKING:
-    from ml_collections import ConfigDict
-
     from model import GPT
 
 

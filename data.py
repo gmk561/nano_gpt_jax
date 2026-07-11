@@ -37,18 +37,16 @@ from __future__ import annotations
 
 import bisect
 import os
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import jax
 import numpy as np
 import requests
 import tiktoken
+from ml_collections import ConfigDict
 from tqdm import tqdm
 
 import grain.python as grain
-
-if TYPE_CHECKING:
-    from ml_collections import ConfigDict
 
 # Grain uses absl.flags internally.  Ensure flags are marked as parsed now so
 # that background worker threads don't raise UnparsedFlagAccessError when they
