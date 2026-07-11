@@ -26,7 +26,6 @@ Configure via ``cfg.model.attention_type`` in ``config.py``.
 
 from __future__ import annotations
 
-from flax.nnx.nn.linear import default_bias_init
 from flax.nnx.nn.attention import dot_product_attention as flax_dot_product_attention
 
 import functools
@@ -378,7 +377,8 @@ def build_attention_module(
 
         * ``nnx.MultiHeadAttention`` with Flax default kernel  (``"flax"``)
         * ``nnx.MultiHeadAttention`` with flash/XLA kernel     (``"flash"``)
-        * :class:`ClassicalMultiHeadAttention`                 (``"classical"``)
+        * :class:`MultiHeadAttention`                          (``"classical"``)
+        * :class:`MemoryEfficientAttention`                    (``"mem_eff"``)
 
     Raises
     ------

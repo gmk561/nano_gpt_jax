@@ -109,10 +109,6 @@ def _apply_overrides(cfg, overrides: list[str]) -> None:
         setattr(obj, parts[-1], value)
 
 
-print("jax.device_count():", jax.device_count())
-
-nnx.use_eager_sharding(True)
-
 # ── W&B setup ─────────────────────────────────────────────────────────────────
 
 
@@ -328,12 +324,9 @@ if __name__ == "__main__":
                 tokens_per_sec = (
                     cfg.sequence_length * cfg.batch_size * cfg.grad_acc_steps / dt
                 )
-                total_tokens = (
-                    micro_step
-                    * cfg.grad_acc_steps
-                    * cfg.sequence_length
-                    * cfg.batch_size
-                )
+                # micro_step already counts every micro-batch, and each
+                # processes batch_size * sequence_length tokens.
+                total_tokens = micro_step * cfg.sequence_length * cfg.batch_size
                 run.log(
                     {
                         "loss": loss.item(),

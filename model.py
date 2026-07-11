@@ -107,16 +107,6 @@ class RoPE(nnx.Module):
         rotated = jnp.stack([-x_perm[..., 1], x_perm[..., 0]], axis=-1)
         return rotated.reshape(x.shape)
 
-    # def __call__(self, x: jnp.ndarray):  # (B, T, H, D)
-    #     rope_cos = self.cos_table[: x.shape[1], : x.shape[-1]]
-    #     rope_sin = self.sin_table[: x.shape[1], : x.shape[-1]]
-
-    #     print(x.shape)
-    #     x1 = jnp.einsum("bthd,td->bthd", x, rope_cos)
-    #     x2 = jnp.einsum("bthd,td->bthd", self._rotate_half(x), rope_sin)
-
-    #     return x1 + x2
-
     def __call__(self, x: jnp.ndarray, position_axis: int = 1):
         T = x.shape[position_axis]
         D = x.shape[-1]
@@ -196,14 +186,15 @@ class GPT(nnx.Module):
             # MLP's second linear (projects back into residual stream)
             if isinstance(parent, MLP) and attr_name == "linear_2":
                 return True
-            # nnx.MultiHeadAttention output projection (FLAX / FLASH types)
-            if isinstance(parent, nnx.MultiHeadAttention) and attr_name == "out":
-                return True
-            # MultiHeadAttention output projection (CLASSICAL / MEM_EFF types)
-            if (
-                isinstance(parent, (MultiHeadAttention, MemoryEfficientAttention))
-                and attr_name == "out"
-            ):
+            # Attention output projection, "out", for all attention types:
+            # nnx.MultiHeadAttention (FLAX / FLASH) and our custom modules
+            # (CLASSICAL / MEM_EFF).
+            attention_types = (
+                nnx.MultiHeadAttention,
+                MultiHeadAttention,
+                MemoryEfficientAttention,
+            )
+            if isinstance(parent, attention_types) and attr_name == "out":
                 return True
             return False
 

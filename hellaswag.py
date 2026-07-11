@@ -236,7 +236,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Import here to avoid circular issues when used as a library
-    from transformer import get_config, GPT, _accelerator_backends
+    from config import get_config
+    from model import GPT
     from data import GPT2_VOCAB_SIZE
 
     cfg = get_config()
