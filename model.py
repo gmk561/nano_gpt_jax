@@ -52,7 +52,6 @@ from attention import (
 )  # noqa: F401
 
 
-
 # ── Model modules ──────────────────────────────────────────────────────────────
 
 
@@ -87,30 +86,72 @@ class MLP(nnx.Module):
         return self.linear_2(nnx.gelu(self.linear_1(x)))
 
 
-class Block(nnx.Module):
-    def __init__(self, config: ConfigDict, rngs: nnx.Rngs):
-        self.config = config
-        # Attention module is selected by config.attention_type.
-        # See attention.py / AttentionType for available options.
-        self.mha = build_attention_module(config, rngs)
-        self.mlp = MLP(config, rngs=rngs)
-        self.layernorm_1 = nnx.LayerNorm(config.n_embd, rngs=rngs)
-        self.layernorm_2 = nnx.LayerNorm(config.n_embd, rngs=rngs)
-
-    def __call__(self, x: jnp.ndarray, mask: jnp.ndarray):
-        x = x + self.mha(
-            self.layernorm_1(x).astype(self.config.compute_dtype), mask=mask
-        )
-        x = x + self.mlp(self.layernorm_2(x).astype(self.config.compute_dtype))
-        return x
-
-
 class RoPE(nnx.Module):
 
     def __init__(self, config: ConfigDict, rngs: nnx.Rngs):
         self.config = config
 
-    def __call__(self, x: jnp.ndarray):
+        head_dim = config.n_embd // config.n_head
+        exponent = jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim
+        freqs = 1.0 / (10000.0**exponent)
+
+        cos = jnp.cos(jnp.outer(freqs, jnp.arange(config.max_seq_len)).T)
+        sin = jnp.sin(jnp.outer(freqs, jnp.arange(config.max_seq_len)).T)
+
+        self.cos_table = jnp.repeat(cos, 2, axis=-1)  # (max_seq_len, head_dim)
+        self.sin_table = jnp.repeat(sin, 2, axis=-1)  # (max_seq_len, head_dim)
+
+    def _rotate_half(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Rotate pairs of features by 90°: (x1, x2) → (−x2, x1)."""
+        x_perm = x.reshape(x.shape[:-1] + (-1, 2))
+        rotated = jnp.stack([-x_perm[..., 1], x_perm[..., 0]], axis=-1)
+        return rotated.reshape(x.shape)
+
+    # def __call__(self, x: jnp.ndarray):  # (B, T, H, D)
+    #     rope_cos = self.cos_table[: x.shape[1], : x.shape[-1]]
+    #     rope_sin = self.sin_table[: x.shape[1], : x.shape[-1]]
+
+    #     print(x.shape)
+    #     x1 = jnp.einsum("bthd,td->bthd", x, rope_cos)
+    #     x2 = jnp.einsum("bthd,td->bthd", self._rotate_half(x), rope_sin)
+
+    #     return x1 + x2
+
+    def __call__(self, x: jnp.ndarray, position_axis: int = 1):
+        T = x.shape[position_axis]
+        D = x.shape[-1]
+
+        rope_cos = self.cos_table[:T, :D]
+        rope_sin = self.sin_table[:T, :D]
+
+        broadcast_shape = [1] * x.ndim
+        broadcast_shape[position_axis] = T
+        broadcast_shape[-1] = D
+
+        rope_cos = jnp.reshape(rope_cos, broadcast_shape)
+        rope_sin = jnp.reshape(rope_sin, broadcast_shape)
+
+        return x * rope_cos + self._rotate_half(x) * rope_sin
+
+
+class Block(nnx.Module):
+    def __init__(self, config: ConfigDict, rngs: nnx.Rngs):
+        self.config = config
+        # Attention module is selected by config.attention_type.
+        # See attention.py / AttentionType for available options.
+        self.mha = build_attention_module(
+            config, rope=RoPE(config, rngs) if config.use_rope else None, rngs=rngs
+        )
+        self.mlp = MLP(config, rngs=rngs)
+        self.layernorm_1 = nnx.LayerNorm(config.n_embd, rngs=rngs)
+        self.layernorm_2 = nnx.LayerNorm(config.n_embd, rngs=rngs)
+
+    def __call__(self, x: jnp.ndarray, mask: jnp.ndarray):
+
+        x = x + self.mha(
+            self.layernorm_1(x).astype(self.config.compute_dtype), mask=mask
+        )
+        x = x + self.mlp(self.layernorm_2(x).astype(self.config.compute_dtype))
         return x
 
 
@@ -119,6 +160,7 @@ class GPT(nnx.Module):
         self.config = config
         # Sharding: (None, None) = replicated for data parallelism.
         # For model parallelism later: change to (None, 'model').
+
         self.wte = nnx.Embed(
             config.vocab_size,
             config.n_embd,
@@ -127,21 +169,22 @@ class GPT(nnx.Module):
             embedding_metadata={"out_sharding": (None, None)},
             dtype=config.compute_dtype,
         )
-        self.wpe = nnx.Embed(
-            config.block_size,
-            config.n_embd,
-            rngs=rngs,
-            embedding_init=nnx.initializers.normal(stddev=0.02),
-            embedding_metadata={"out_sharding": (None, None)},
-            dtype=config.compute_dtype,
-        )
+        if not config.use_rope:
+            self.wpe = nnx.Embed(
+                config.max_seq_len,
+                config.n_embd,
+                rngs=rngs,
+                embedding_init=nnx.initializers.normal(stddev=0.02),
+                embedding_metadata={"out_sharding": (None, None)},
+                dtype=config.compute_dtype,
+            )
         self.blocks = nnx.List(
             [Block(config, rngs=rngs) for _ in range(config.n_layer)]
         )
         self.ln_f = nnx.LayerNorm(config.n_embd, rngs=rngs)
-        # Pre-compute causal mask once for the full block_size; slice at call time.
+        # Pre-compute causal mask once for the full max_seq_len; slice at call time.
         self._causal_mask = jnp.tril(
-            jnp.ones((1, 1, config.block_size, config.block_size), dtype=jnp.bool_)
+            jnp.ones((1, 1, config.max_seq_len, config.max_seq_len), dtype=jnp.bool_)
         )
         self._init_weights(rngs)
 
@@ -216,10 +259,11 @@ class GPT(nnx.Module):
         B, T = x.shape
         # Slice the pre-computed mask for the actual sequence length.
         mask = self._causal_mask[:, :, :T, :T]
-        pos = jnp.arange(T)
-        x = self.wte(x, out_sharding=jax.typeof(x).sharding) + self.wpe(
-            pos
-        )  # (B, T, n_embd)
+
+        x = self.wte(x, out_sharding=jax.typeof(x).sharding)
+        if not self.config.use_rope:
+            x = x + self.wpe(jnp.arange(T))
+
         for block in self.blocks:
             x = block(x, mask)
         x = self.ln_f(x).astype(self.config.compute_dtype)

@@ -36,6 +36,7 @@ import math
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from flax import nnx
 from ml_collections import ConfigDict
@@ -46,6 +47,7 @@ from attention import (
     MultiHeadAttention,
     build_attention_module,
 )
+from model import RoPE
 
 # ── Shared mesh (needed for nnx sharding annotations) ─────────────────────────
 
@@ -523,3 +525,63 @@ class TestAttentionMemory:
             + _full_report("MultiHeadAttention", classical_analysis)
             + _full_report("MemoryEfficientAttention", mem_eff_analysis)
         )
+
+
+# ── RoPE tests ───────────────────────────────────────────────────────────────
+
+
+class TestRoPE:
+    def _make_config(self, n_embd=16, n_head=4, max_seq_len=32, use_rope=True):
+        cfg = ConfigDict()
+        cfg.n_embd = n_embd
+        cfg.n_head = n_head
+        cfg.max_seq_len = max_seq_len
+        cfg.use_rope = use_rope
+        cfg.attention_type = "classical"
+        cfg.use_attention_bias = True
+        cfg.compute_dtype = jnp.float32
+        cfg.query_chunk_size = 4
+        cfg.key_chunk_size = 4
+        return cfg
+
+    def test_rope_shapes(self):
+        cfg = self._make_config()
+        rope = RoPE(cfg, rngs=nnx.Rngs(0))
+
+        # Test (B, T, H, D) layout (custom attention)
+        x = jax.random.normal(jax.random.PRNGKey(0), (2, 8, 4, 4))
+        out = rope(x, position_axis=1)
+        assert out.shape == x.shape
+
+        # Test (B, H, T, D) layout (flax attention)
+        x_flax = jax.random.normal(jax.random.PRNGKey(0), (2, 4, 8, 4))
+        out_flax = rope(x_flax, position_axis=2)
+        assert out_flax.shape == x_flax.shape
+
+    def test_rope_norm(self):
+        cfg = self._make_config()
+        rope = RoPE(cfg, rngs=nnx.Rngs(0))
+
+        x = jax.random.normal(jax.random.PRNGKey(0), (1, 8, 4, 4))
+        out = rope(x, position_axis=1)
+
+        # L2 norm along the head dimension should be preserved
+        norm_in = jnp.linalg.norm(x, axis=-1)
+        norm_out = jnp.linalg.norm(out, axis=-1)
+        np.testing.assert_allclose(norm_in, norm_out, atol=1e-5)
+
+    @pytest.mark.parametrize("attn_type", ["flax", "flash", "classical", "mem_eff"])
+    def test_attention_with_rope(self, attn_type):
+        cfg = self._make_config()
+        cfg.attention_type = attn_type
+        
+        with jax.set_mesh(_MESH):
+            # Build the attention module with use_rope = True
+            attn = build_attention_module(cfg, rope=RoPE(cfg, rngs=nnx.Rngs(0)), rngs=nnx.Rngs(0))
+            
+            # (B, T, D)
+            x = jax.random.normal(jax.random.PRNGKey(0), (2, 8, 16))
+            
+            # Call it
+            out = attn(x)
+            assert out.shape == x.shape

@@ -46,7 +46,7 @@ def get_config() -> ConfigDict:
 
     # GPT model config
     cfg.model = ConfigDict()
-    cfg.model.block_size = cfg.sequence_length
+    cfg.model.max_seq_len = cfg.sequence_length
     cfg.model.vocab_size = -1
     cfg.model.n_layer = 6
     cfg.model.n_head = 6
@@ -59,6 +59,7 @@ def get_config() -> ConfigDict:
     # See attention.py / AttentionType for details.
     cfg.model.attention_type = "flash"  # cuDNN on GPU, XLA fallback on CPU
     cfg.model.use_attention_bias = True
+    cfg.model.use_rope = True
 
     return cfg
 

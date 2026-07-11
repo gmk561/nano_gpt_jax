@@ -27,6 +27,7 @@ Configure via ``cfg.model.attention_type`` in ``config.py``.
 from __future__ import annotations
 
 from flax.nnx.nn.linear import default_bias_init
+from flax.nnx.nn.attention import dot_product_attention as flax_dot_product_attention
 
 import functools
 import math
@@ -87,7 +88,7 @@ def is_cudnn_available() -> bool:
 
 
 def _flash_attention_kernel(
-    query, key, value, bias=None, mask=None, is_causal: bool = True, **kwargs
+    query, key, value, rope=None, bias=None, mask=None, is_causal: bool = True, **kwargs
 ):
     """JAX ``dot_product_attention`` dispatching to cuDNN when available.
 
@@ -96,6 +97,10 @@ def _flash_attention_kernel(
     are still managed by ``nnx.MultiHeadAttention``.
     """
     impl = "cudnn" if is_cudnn_available() else "xla"
+
+    query = query if rope is None else rope(query, position_axis=2)
+    key = key if rope is None else rope(key, position_axis=2)
+
     return jax.nn.dot_product_attention(
         query,
         key,
@@ -114,6 +119,7 @@ class MultiHeadAttention(nnx.Module):
         n_embd: int,
         num_heads: int,
         use_bias: bool,
+        rope: nnx.Module | None = None,
         kernel_init: nnx.initializers.Initializer = nnx.initializers.lecun_normal(),
         bias_init: nnx.initializers.Initializer = nnx.initializers.zeros_init(),
         *,
@@ -155,6 +161,7 @@ class MultiHeadAttention(nnx.Module):
             rngs=rngs,
             axis=(-2, -1),
         )
+        self.rope = rope
 
     def softmax(self, qk):
         max_element = jnp.max(qk, axis=-1, keepdims=True)
@@ -168,6 +175,10 @@ class MultiHeadAttention(nnx.Module):
         B, T, D = x.shape
 
         q, k, v = (self.query(x), self.key(x), self.value(x))  # (B, T, D)
+
+        q = q if self.rope is None else self.rope(q)
+        k = k if self.rope is None else self.rope(k)
+
         qk = jnp.einsum("...qhd,...khd->...hqk", q, k)
         if mask is not None:
             qk = jnp.where(mask, qk, -jnp.inf)
@@ -192,6 +203,7 @@ class MemoryEfficientAttention(nnx.Module):
         kernel_init: nnx.initializers.Initializer = nnx.initializers.lecun_normal(),
         bias_init: nnx.initializers.Initializer = nnx.initializers.zeros_init(),
         *,
+        rope: nnx.Module | None = None,
         rngs: nnx.Rngs,
     ) -> None:
         if n_embd % num_heads != 0:
@@ -219,6 +231,7 @@ class MemoryEfficientAttention(nnx.Module):
             bias_init=bias_init,
         )
 
+        self.rope = rope
         self.query = linear(rngs=rngs)
         self.key = linear(rngs=rngs)
         self.value = linear(rngs=rngs)
@@ -309,6 +322,9 @@ class MemoryEfficientAttention(nnx.Module):
 
     def __call__(self, x, mask=None):
         q, k, v = self.query(x), self.key(x), self.value(x)
+        if self.rope is not None:
+            q = self.rope(q, position_axis=1)
+            k = self.rope(k, position_axis=1)
 
         B, T, H, D = q.shape
 
@@ -339,7 +355,12 @@ class MemoryEfficientAttention(nnx.Module):
         return self.out(att.transpose(1, 0, 3, 2, 4).reshape(B, T, H, D))
 
 
-def build_attention_module(config: ConfigDict, rngs: nnx.Rngs) -> nnx.Module:
+def build_attention_module(
+    config: ConfigDict,
+    *,
+    rope: nnx.Module | None = None,
+    rngs: nnx.Rngs,
+) -> nnx.Module:
     """Return the attention module specified by ``config.attention_type``.
 
     Parameters
@@ -388,14 +409,23 @@ def build_attention_module(config: ConfigDict, rngs: nnx.Rngs) -> nnx.Module:
 
     if attn_type == AttentionType.FLAX:
         # nnx.MultiHeadAttention with its built-in default kernel.
-        # No custom attention_fn → uses Flax's reference implementation.
+        if rope is not None:
+            def rope_flax_attention_fn(query, key, value, bias=None, mask=None, **kwargs):
+                query = rope(query, position_axis=2)
+                key = rope(key, position_axis=2)
+                return flax_dot_product_attention(
+                    query, key, value, bias=bias, mask=mask, **kwargs
+                )
+            mha_kwargs["attention_fn"] = rope_flax_attention_fn
         return nnx.MultiHeadAttention(**mha_kwargs)
 
     if attn_type == AttentionType.FLASH:
         # Custom inner kernel: cuDNN flash on GPU, XLA otherwise.
         return nnx.MultiHeadAttention(
             **mha_kwargs,
-            attention_fn=functools.partial(_flash_attention_kernel, is_causal=True),
+            attention_fn=functools.partial(
+                _flash_attention_kernel, rope=rope, is_causal=True
+            ),
         )
 
     if attn_type == AttentionType.CLASSICAL:
@@ -403,6 +433,7 @@ def build_attention_module(config: ConfigDict, rngs: nnx.Rngs) -> nnx.Module:
             n_embd=config.n_embd,
             num_heads=config.n_head,
             use_bias=config.use_attention_bias,
+            rope=rope,
             kernel_init=init_fn,
             bias_init=zeros,
             rngs=rngs,
@@ -418,6 +449,7 @@ def build_attention_module(config: ConfigDict, rngs: nnx.Rngs) -> nnx.Module:
             use_bias=config.use_attention_bias,
             query_chunk_size=query_chunk_size,
             key_chunk_size=key_chunk_size,
+            rope=rope,
             kernel_init=init_fn,
             bias_init=zeros,
             rngs=rngs,
