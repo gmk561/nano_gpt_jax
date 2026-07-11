@@ -22,6 +22,7 @@ restore_from_checkpoint(cfg, ckpt_mngr, model, optimizer, train_iter)
 from __future__ import annotations
 
 import os
+import threading
 from typing import TYPE_CHECKING
 
 import orbax.checkpoint as ocp
@@ -139,18 +140,23 @@ def save_checkpoint(
     with open(grain_state_path, "wb") as fh:
         fh.write(get_iter_state(train_iter))
 
-    # Optionally upload to W&B as an artifact.
+    # Optionally upload to W&B as an artifact — done in a background thread
+    # so it does not block training between checkpoints.
     if wandb_run is not None:
-        try:
-            import wandb
+        ckpt_path = os.path.join(cfg.ckpt_dir, str(step))
 
-            artifact = wandb.Artifact(f"checkpoint-step-{step}", type="model")
-            ckpt_path = os.path.join(cfg.ckpt_dir, str(step))
-            if os.path.isdir(ckpt_path):
-                artifact.add_dir(ckpt_path)
-                wandb_run.log_artifact(artifact)
-        except Exception as e:
-            print(f"  ⚠ W&B artifact upload failed: {e}")
+        def _upload(run=wandb_run, path=ckpt_path, s=step):
+            try:
+                import wandb
+
+                artifact = wandb.Artifact(f"checkpoint-step-{s}", type="model")
+                if os.path.isdir(path):
+                    artifact.add_dir(path)
+                    run.log_artifact(artifact)
+            except Exception as e:
+                print(f"  ⚠ W&B artifact upload failed: {e}")
+
+        threading.Thread(target=_upload, daemon=True).start()
 
 
 def restore_from_checkpoint(

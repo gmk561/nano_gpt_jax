@@ -31,6 +31,9 @@ def get_config() -> ConfigDict:
     cfg.val_max_steps = 50  # max number of batches to use for validation
     cfg.max_steps = 10_000  # total training steps
     cfg.warmup_steps = 715
+    cfg.learning_rate = 6e-4
+    cfg.lr_end_ratio = 0.1  # end_value = learning_rate * lr_end_ratio
+    cfg.seed = 0
 
     # Checkpointing config
     cfg.ckpt_dir_name = "checkpoints"
@@ -52,7 +55,7 @@ def get_config() -> ConfigDict:
     cfg.model.compute_dtype = jnp.bfloat16 if cfg.apply_dtype_policy else jnp.float32
     cfg.model.accum_dtype = jnp.float32
 
-    # Attention implementation: "flash" | "flax" | "classical"
+    # Attention implementation: "flash" | "flax" | "classical" | "mem_eff"
     # See attention.py / AttentionType for details.
     cfg.model.attention_type = "flash"  # cuDNN on GPU, XLA fallback on CPU
     cfg.model.use_attention_bias = True

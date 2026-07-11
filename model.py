@@ -44,9 +44,7 @@ import jax.numpy as jnp
 import optax
 from flax import nnx
 
-from attention import build_attention_module, is_cudnn_available  # noqa: F401
-
-from attention import MultiHeadAttention, MemoryEfficientAttention
+from attention import build_attention_module, is_cudnn_available, MultiHeadAttention, MemoryEfficientAttention  # noqa: F401
 
 if TYPE_CHECKING:
     from ml_collections import ConfigDict
@@ -146,10 +144,11 @@ class GPT(nnx.Module):
             # nnx.MultiHeadAttention output projection (FLAX / FLASH types)
             if isinstance(parent, nnx.MultiHeadAttention) and attr_name == "out":
                 return True
-            # ClassicalMultiHeadAttention output projection (CLASSICAL type)
-            if isinstance(parent, MultiHeadAttention) and attr_name == "out_proj":
-                return True
-            if isinstance(parent, MemoryEfficientAttention) and attr_name == "out_proj":
+            # MultiHeadAttention output projection (CLASSICAL / MEM_EFF types)
+            if (
+                isinstance(parent, (MultiHeadAttention, MemoryEfficientAttention))
+                and attr_name == "out"
+            ):
                 return True
             return False
 
