@@ -410,12 +410,16 @@ def build_attention_module(
     if attn_type == AttentionType.FLAX:
         # nnx.MultiHeadAttention with its built-in default kernel.
         if rope is not None:
-            def rope_flax_attention_fn(query, key, value, bias=None, mask=None, **kwargs):
+
+            def rope_flax_attention_fn(
+                query, key, value, bias=None, mask=None, **kwargs
+            ):
                 query = rope(query, position_axis=2)
                 key = rope(key, position_axis=2)
                 return flax_dot_product_attention(
                     query, key, value, bias=bias, mask=mask, **kwargs
                 )
+
             mha_kwargs["attention_fn"] = rope_flax_attention_fn
         return nnx.MultiHeadAttention(**mha_kwargs)
 

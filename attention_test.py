@@ -36,7 +36,6 @@ import math
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import pytest
 from flax import nnx
 from ml_collections import ConfigDict
@@ -574,14 +573,16 @@ class TestRoPE:
     def test_attention_with_rope(self, attn_type):
         cfg = self._make_config()
         cfg.attention_type = attn_type
-        
+
         with jax.set_mesh(_MESH):
             # Build the attention module with use_rope = True
-            attn = build_attention_module(cfg, rope=RoPE(cfg, rngs=nnx.Rngs(0)), rngs=nnx.Rngs(0))
-            
+            attn = build_attention_module(
+                cfg, rope=RoPE(cfg, rngs=nnx.Rngs(0)), rngs=nnx.Rngs(0)
+            )
+
             # (B, T, D)
             x = jax.random.normal(jax.random.PRNGKey(0), (2, 8, 16))
-            
+
             # Call it
             out = attn(x)
             assert out.shape == x.shape
