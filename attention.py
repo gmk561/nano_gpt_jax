@@ -82,7 +82,6 @@ def _flash_attention_kernel(
         mask=mask if not is_causal else None,
         is_causal=is_causal,
         implementation=impl,
-        normalize_qk=True,
     )
 
 
@@ -355,6 +354,7 @@ def build_attention_module(
         bias_metadata={"out_sharding": (None,)},
         out_bias_init=zeros,
         out_bias_metadata={"out_sharding": (None,)},
+        normalize_qk=True,
     )
 
     if attn_type == AttentionType.FLAX:

@@ -98,8 +98,6 @@ class CharTokenizer:
         return "".join(self.itos[i] for i in tokens)
 
 
-# ── EduFineweb shard data source ───────────────────────────────────────────────
-
 
 class EduFinewebShardSource:
     """Grain-compatible data source over pre-tokenized EduFineweb ``.npy`` shards.
