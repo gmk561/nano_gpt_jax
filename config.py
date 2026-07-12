@@ -41,7 +41,7 @@ def get_config() -> ConfigDict:
     cfg.val_check_steps = 200  # evaluate validation loss every 100 steps
     cfg.val_max_steps = 50  # max number of batches to use for validation
     cfg.max_steps = 10000  # total training steps
-    cfg.warmup_steps = 500
+    cfg.warmup_steps = cfg.max_steps * 0.2
     # cfg.learning_rate = 6e-4
     # cfg.learning_rate = 1e-3
     # cfg.learning_rate = 5e-3
