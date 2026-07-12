@@ -37,7 +37,7 @@ parser.add_argument(
 parser.add_argument(
     "--num-steps",
     type=int,
-    default=100,
+    default=5000,
     help="Number of training steps to download data for. Use -1 to download the whole dataset.",
 )
 args = parser.parse_args()
