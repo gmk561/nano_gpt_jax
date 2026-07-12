@@ -341,12 +341,12 @@ if __name__ == "__main__":
                         "step_time_ms": dt * 1000,
                         "tokens_per_sec": tokens_per_sec,
                         "learning_rate": schedule(global_step).item(),
-                        "total_tokens": total_tokens,
+                        "total_tokens_b": total_tokens / 1e9,
                     },
                     step=global_step,
                 )
                 print(
-                    f"step {global_step:4d} | loss {loss:.4f} | lr: {schedule(global_step):.4f} | time {dt * 1000:.2f} ms | tokens/sec {tokens_per_sec:.2f} | tokens {total_tokens}"
+                    f"step {global_step:4d} | loss {loss:.4f} | lr: {schedule(global_step):.4f} | time {dt * 1000:.2f} ms | tokens/sec {tokens_per_sec:.2f} | tokens {total_tokens / 1e9:.3f}B"
                 )
                 t0 = time.time()
 

@@ -82,6 +82,7 @@ def _flash_attention_kernel(
         mask=mask if not is_causal else None,
         is_causal=is_causal,
         implementation=impl,
+        normalize_qk=True,
     )
 
 
@@ -410,3 +411,11 @@ def build_attention_module(
         f"Unknown attention_type {config.attention_type!r}. "
         f"Valid choices: {[e.value for e in AttentionType]}"
     )
+
+
+# All concrete attention module classes — used for isinstance checks elsewhere.
+ATTENTION_TYPES = (
+    nnx.MultiHeadAttention,
+    MultiHeadAttention,
+    MemoryEfficientAttention,
+)

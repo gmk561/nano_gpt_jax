@@ -27,24 +27,25 @@ class ActivationType(StrEnum):
 
 def get_config() -> ConfigDict:
     cfg = ConfigDict()
-    cfg.sequence_length = 1024
     # Mixed precision: use bfloat16 for faster computation, weights remain float32,
     # activations are bfloat16. Don't apply to LayerNorm as it sums many values —
     # this can lead to overflow or underflow.
     cfg.apply_dtype_policy = True
+    cfg.sequence_length = 1024
     cfg.num_devices = jax.device_count()
-    cfg.device_batch_size = 32
+    cfg.device_batch_size = 128
     cfg.batch_size = cfg.device_batch_size * cfg.num_devices
-    cfg.gpt_batch_size = 524288
-    cfg.grad_acc_steps = cfg.gpt_batch_size // (cfg.batch_size * cfg.sequence_length)
+    cfg.tokens_per_batch = 524288
+    cfg.grad_acc_steps = cfg.tokens_per_batch // (cfg.batch_size * cfg.sequence_length)
     cfg.dataset = "edu_fineweb"  # "input_txt" or "edu_fineweb"
     cfg.val_check_steps = 100  # evaluate validation loss every 100 steps
     cfg.val_max_steps = 50  # max number of batches to use for validation
-    cfg.max_steps = 1000  # total training steps
-    cfg.warmup_steps = 150
+    cfg.max_steps = 5000  # total training steps
+    cfg.warmup_steps = 500
     # cfg.learning_rate = 6e-4
     # cfg.learning_rate = 1e-3
-    cfg.learning_rate = 5e-3
+    # cfg.learning_rate = 5e-3
+    cfg.learning_rate = 1.5e-3
     # cfg.learning_rate = 1e-2
     cfg.lr_end_ratio = 0.1  # end_value = learning_rate * lr_end_ratio
     cfg.lr_schedule = LRSchedule.TRAPEZOIDAL.value
@@ -75,7 +76,7 @@ def get_config() -> ConfigDict:
     cfg.model.attention_type = "flash"  # cuDNN on GPU, XLA fallback on CPU
     cfg.model.use_attention_bias = True
     cfg.model.use_rope = True
-    cfg.model.activation = ActivationType.GELU.value
+    cfg.model.activation = ActivationType.RELU_SQUARED.value
 
     return cfg
 
@@ -86,7 +87,7 @@ def get_cpu_test_config() -> ConfigDict:
     cfg.apply_dtype_policy = False
     cfg.device_batch_size = 1
     cfg.batch_size = cfg.device_batch_size * cfg.num_devices
-    cfg.gpt_batch_size = cfg.batch_size
+    cfg.tokens_per_batch = cfg.batch_size * cfg.sequence_length
     cfg.grad_acc_steps = 1
     cfg.val_check_steps = 10  # evaluate validation loss every 10 steps
     cfg.val_max_steps = 4  # max number of batches to use for validation

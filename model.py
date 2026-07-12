@@ -10,7 +10,7 @@ Classes
 MLP
     Two-layer feed-forward block with GELU activation.
 Block
-    Single transformer block: multi-head attention + MLP + LayerNorm.
+    Single transformer block: multi-head attention + MLP + RMSNorm.
 GPT
     Full GPT language model with weight tying.
 
@@ -47,8 +47,7 @@ from ml_collections import ConfigDict
 from attention import (
     build_attention_module,
     is_cudnn_available,
-    MultiHeadAttention,
-    MemoryEfficientAttention,
+    ATTENTION_TYPES,
 )  # noqa: F401
 from config import ActivationType
 
@@ -68,6 +67,27 @@ def get_activation_fn(activation: ActivationType | str):
         return relu_squared
     else:
         raise ValueError(f"Unknown activation type: {activation}")
+
+
+class RMSNorm(nnx.Module):
+
+    def __init__(self, dim: int, eps: float = 1e-5):
+        self.eps = eps
+        self.weight = nnx.Param(jnp.ones((dim,), dtype=jnp.float32))
+
+
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        x_dtype = x.dtype
+        x_fp32 = x.astype(jnp.float32)
+
+        variance = jnp.mean(jnp.square(x_fp32), axis=-1, keepdims=True)
+        inv_rms = jax.lax.rsqrt(variance + self.eps)
+
+        normed = x_fp32 * inv_rms
+        output = normed * self.weight.value
+
+        return output.astype(x.dtype)
+
 
 
 class MLP(nnx.Module):
@@ -121,7 +141,7 @@ class RoPE(nnx.Module):
     def _rotate_half(self, x: jnp.ndarray) -> jnp.ndarray:
         """Rotate pairs of features by 90°: (x1, x2) → (−x2, x1)."""
         x_perm = x.reshape(x.shape[:-1] + (-1, 2))
-        rotated = jnp.stack([-x_perm[..., 1], x_perm[...,]], axis=-1)
+        rotated = jnp.stack([-x_perm[..., 1], x_perm[..., 0]], axis=-1)
         return rotated.reshape(x.shape)
 
     def __call__(self, x: jnp.ndarray, position_axis: int = 1):
@@ -152,8 +172,8 @@ class Block(nnx.Module):
             config, rope=RoPE(config, rngs) if config.use_rope else None, rngs=rngs
         )
         self.mlp = MLP(config, rngs=rngs)
-        self.layernorm_1 = nnx.LayerNorm(config.n_embd, rngs=rngs)
-        self.layernorm_2 = nnx.LayerNorm(config.n_embd, rngs=rngs)
+        self.layernorm_1 = RMSNorm(config.n_embd)
+        self.layernorm_2 = RMSNorm(config.n_embd)
 
     def __call__(self, x: jnp.ndarray, mask: jnp.ndarray):
 
@@ -167,9 +187,6 @@ class Block(nnx.Module):
 class GPT(nnx.Module):
     def __init__(self, config: ConfigDict, rngs: nnx.Rngs):
         self.config = config
-        # Sharding: (None, None) = replicated for data parallelism.
-        # For model parallelism later: change to (None, 'model').
-
         self.wte = nnx.Embed(
             config.vocab_size,
             config.n_embd,
@@ -190,8 +207,7 @@ class GPT(nnx.Module):
         self.blocks = nnx.List(
             [Block(config, rngs=rngs) for _ in range(config.n_layer)]
         )
-        self.ln_f = nnx.LayerNorm(config.n_embd, rngs=rngs)
-        # Pre-compute causal mask once for the full max_seq_len; slice at call time.
+        self.ln_f = RMSNorm(config.n_embd)
         self._causal_mask = jnp.tril(
             jnp.ones((1, 1, config.max_seq_len, config.max_seq_len), dtype=jnp.bool_)
         )
@@ -202,18 +218,9 @@ class GPT(nnx.Module):
 
         def _is_residual_output(module, parent, attr_name):
             """Check if this Linear is the output projection of a residual branch."""
-            # MLP's second linear (projects back into residual stream)
             if isinstance(parent, MLP) and attr_name == "linear_2":
                 return True
-            # Attention output projection, "out", for all attention types:
-            # nnx.MultiHeadAttention (FLAX / FLASH) and our custom modules
-            # (CLASSICAL / MEM_EFF).
-            attention_types = (
-                nnx.MultiHeadAttention,
-                MultiHeadAttention,
-                MemoryEfficientAttention,
-            )
-            if isinstance(parent, attention_types) and attr_name == "out":
+            if isinstance(parent, ATTENTION_TYPES) and attr_name == "out":
                 return True
             return False
 
@@ -267,7 +274,6 @@ class GPT(nnx.Module):
 
     def __call__(self, x: jax.Array):
         B, T = x.shape
-        # Slice the pre-computed mask for the actual sequence length.
         mask = self._causal_mask[:, :, :T, :T]
 
         x = self.wte(x, out_sharding=jax.typeof(x).sharding)
@@ -277,12 +283,9 @@ class GPT(nnx.Module):
         for block in self.blocks:
             x = block(x, mask)
         x = self.ln_f(x).astype(self.config.compute_dtype)
-        # weight tying: reuse wte embedding matrix as output projection
         logits = x @ self.wte.embedding[...].T  # (B, T, vocab_size)
         return logits.astype(self.config.accum_dtype)
 
-
-# ── Dtype utilities ────────────────────────────────────────────────────────────
 
 
 def cast_params(module: nnx.Module, dtype):

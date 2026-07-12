@@ -54,16 +54,16 @@ else:
     if args.num_steps == -1:
         total_shards = args.num_shards
     else:
-        # Fetch GPT batch size (tokens per step) from transformer configuration statically
-        gpt_batch_size = 524288  # default fallback
+        # Fetch tokens per batch (tokens per step) from transformer configuration statically
+        tokens_per_batch = 524288  # default fallback
 
         # Compute required shards based on training steps and batch size
-        train_tokens = args.num_steps * gpt_batch_size
+        train_tokens = args.num_steps * tokens_per_batch
         train_shards = int(np.ceil(train_tokens / shard_size))
         train_shards = max(1, train_shards)
         total_shards = val_shards + train_shards
         print(f"Configured for first {args.num_steps} steps of training:")
-        print(f"  GPT batch size: {gpt_batch_size} tokens/step")
+        print(f"  Tokens per batch: {tokens_per_batch} tokens/step")
         print(f"  Required training tokens: {train_tokens}")
         print(
             f"  Required shards: {train_shards} train + {val_shards} val = {total_shards} total shards"
