@@ -40,35 +40,12 @@ from ml_collections import ConfigDict
 
 Array = jax.Array
 
-# ── Enum ───────────────────────────────────────────────────────────────────────
-
 
 class AttentionType(str, Enum):
-    """Selects the multi-head attention implementation used in each transformer block.
-
-    Use a plain string value in ``cfg.model.attention_type``; the enum is used
-    internally for exhaustive matching.
-
-    Values
-    ------
-    ``"flax"``
-        Reference: ``nnx.MultiHeadAttention`` with Flax's default kernel.
-    ``"flash"``
-        Production: ``nnx.MultiHeadAttention`` + JAX flash/XLA kernel.
-    ``"classical"``
-        Exercise: explicit SDPA from "Attention is All You Need".
-    ``"mem_eff"``
-        Chunked online-softmax (Rabe & Staats 2022) — trades peak memory for
-        constant-memory attention via ``jax.lax.scan`` + ``jax.lax.map``.
-    """
-
     FLAX = "flax"
     FLASH = "flash"
-    CLASSICAL = "classical"  # reimplementation of Attention is all you need paper.
+    CLASSICAL = "classical"
     MEM_EFF = "mem_eff"
-
-
-# ── cuDNN detection ────────────────────────────────────────────────────────────
 
 
 def is_cudnn_available() -> bool:
@@ -81,9 +58,6 @@ def is_cudnn_available() -> bool:
         )
     except (ImportError, AttributeError, RuntimeError):
         return False
-
-
-# ── Inner attention kernels ────────────────────────────────────────────────────
 
 
 def _flash_attention_kernel(
@@ -111,7 +85,8 @@ def _flash_attention_kernel(
     )
 
 
-# Implementation of the classical Attention is all you need paper: https://arxiv.org/abs/1706.03762
+# Implementation of the classical
+# Attention is all you need paper: https://arxiv.org/abs/1706.03762
 class MultiHeadAttention(nnx.Module):
     def __init__(
         self,
@@ -360,36 +335,10 @@ def build_attention_module(
     rope: nnx.Module | None = None,
     rngs: nnx.Rngs,
 ) -> nnx.Module:
-    """Return the attention module specified by ``config.attention_type``.
-
-    Parameters
-    ----------
-    config:
-        Model config; must contain ``attention_type`` (str or
-        :class:`AttentionType`) plus ``n_head``, ``n_embd``, ``compute_dtype``.
-    rngs:
-        NNX PRNG key bundle.
-
-    Returns
-    -------
-    nnx.Module
-        One of:
-
-        * ``nnx.MultiHeadAttention`` with Flax default kernel  (``"flax"``)
-        * ``nnx.MultiHeadAttention`` with flash/XLA kernel     (``"flash"``)
-        * :class:`MultiHeadAttention`                          (``"classical"``)
-        * :class:`MemoryEfficientAttention`                    (``"mem_eff"``)
-
-    Raises
-    ------
-    ValueError
-        If ``config.attention_type`` does not match any :class:`AttentionType`.
-    """
     attn_type = AttentionType(config.attention_type)
     init_fn = nnx.initializers.normal(stddev=0.02)
     zeros = nnx.initializers.zeros_init()
 
-    # Shared kwargs for nnx.MultiHeadAttention-based types
     mha_kwargs = dict(
         num_heads=config.n_head,
         in_features=config.n_embd,
@@ -408,7 +357,6 @@ def build_attention_module(
     )
 
     if attn_type == AttentionType.FLAX:
-        # nnx.MultiHeadAttention with its built-in default kernel.
         if rope is not None:
 
             def rope_flax_attention_fn(
@@ -444,7 +392,6 @@ def build_attention_module(
         )
 
     if attn_type == AttentionType.MEM_EFF:
-        # Chunk sizes default to 64; can be overridden via config.
         query_chunk_size = getattr(config, "query_chunk_size", 64)
         key_chunk_size = getattr(config, "key_chunk_size", 64)
         return MemoryEfficientAttention(
