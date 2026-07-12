@@ -8,10 +8,21 @@ Provides three configs:
 """
 
 import os
+from enum import StrEnum
 
 import jax
 import jax.numpy as jnp
 from ml_collections import ConfigDict
+
+
+class LRSchedule(StrEnum):
+    COSINE = "cosine"
+    TRAPEZOIDAL = "trapezoidal"
+
+
+class ActivationType(StrEnum):
+    GELU = "gelu"
+    RELU_SQUARED = "relu^2"
 
 
 def get_config() -> ConfigDict:
@@ -30,12 +41,13 @@ def get_config() -> ConfigDict:
     cfg.val_check_steps = 100  # evaluate validation loss every 100 steps
     cfg.val_max_steps = 50  # max number of batches to use for validation
     cfg.max_steps = 1000  # total training steps
-    cfg.warmup_steps = 100
+    cfg.warmup_steps = 150
     # cfg.learning_rate = 6e-4
     # cfg.learning_rate = 1e-3
-    # cfg.learning_rate = 5e-3
-    cfg.learning_rate = 1e-2
+    cfg.learning_rate = 5e-3
+    # cfg.learning_rate = 1e-2
     cfg.lr_end_ratio = 0.1  # end_value = learning_rate * lr_end_ratio
+    cfg.lr_schedule = LRSchedule.TRAPEZOIDAL.value
     cfg.seed = 0
 
     # Checkpointing config
@@ -63,6 +75,7 @@ def get_config() -> ConfigDict:
     cfg.model.attention_type = "flash"  # cuDNN on GPU, XLA fallback on CPU
     cfg.model.use_attention_bias = True
     cfg.model.use_rope = True
+    cfg.model.activation = ActivationType.GELU.value
 
     return cfg
 

@@ -57,11 +57,8 @@ if not _absl_flags.FLAGS.is_parsed():
     _absl_flags.FLAGS.mark_as_parsed()
 
 
-# ── Public constants ───────────────────────────────────────────────────────────
-
-#: GPT-2 vocabulary size; assign to ``cfg.model.vocab_size`` before building
-#: the model when using either the EduFineweb or input.txt datasets.
-GPT2_VOCAB_SIZE: int = tiktoken.get_encoding("gpt2").n_vocab
+# GPT2_VOCAB_SIZE: int = tiktoken.get_encoding("gpt2").n_vocab
+GPT2_VOCAB_SIZE: int = 50304
 
 _EDU_FINEWEB_DATA_DIR: str = os.path.join(os.path.dirname(__file__), "edu_fineweb10B")
 _HELLASWAG_DATA_DIR: str = os.path.join(os.path.dirname(__file__), "hellaswag")

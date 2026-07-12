@@ -50,7 +50,7 @@ from checkpoint import (
     restore_from_checkpoint,
     save_checkpoint,
 )
-from config import get_config, get_cpu_test_config, get_mem_eff_config
+from config import LRSchedule, get_config, get_cpu_test_config, get_mem_eff_config
 from data import GPT2_VOCAB_SIZE, create_train_loader, create_val_loader
 from model import (
     GPT,
@@ -61,8 +61,6 @@ from model import (
     val_step,
 )
 
-
-# ── CLI ────────────────────────────────────────────────────────────────────────
 
 _CONFIGS = {
     "gpu": get_config,
@@ -109,9 +107,6 @@ def _apply_overrides(cfg, overrides: list[str]) -> None:
         setattr(obj, parts[-1], value)
 
 
-# ── W&B setup ─────────────────────────────────────────────────────────────────
-
-
 class MockWandb:
     @staticmethod
     def init(*args, **kwargs):
@@ -142,23 +137,26 @@ else:
     import wandb  # type: ignore[no-redef]
 
 
-
 _accelerator_backends = {"gpu", "tpu"}
 
 
 def trapezoidal_schedule(config):
     warmup_schedule = optax.linear_schedule(
-        init_value=0.0, end_value=config.learning_rate, transition_steps=config.warmup_steps)
-    plateau_schedule = optax.constant_schedule(
-        value=config.learning_rate)
+        init_value=0.0,
+        end_value=config.learning_rate,
+        transition_steps=config.warmup_steps,
+    )
+    plateau_schedule = optax.constant_schedule(value=config.learning_rate)
     decay_schedule = optax.linear_schedule(
-        init_value=config.learning_rate, transition_steps=config.warmup_steps, end_value=0.0)
-
-    return optax.join_schedules(
-        schedules=[warmup_schedule, plateau_schedule, decay_schedule], 
-        boundaries=[config.warmup_steps, config.max_steps - config.warmup_steps]
+        init_value=config.learning_rate,
+        transition_steps=config.warmup_steps,
+        end_value=0.0,
     )
 
+    return optax.join_schedules(
+        schedules=[warmup_schedule, plateau_schedule, decay_schedule],
+        boundaries=[config.warmup_steps, config.max_steps - config.warmup_steps],
+    )
 
 
 if __name__ == "__main__":
@@ -199,20 +197,25 @@ if __name__ == "__main__":
 
         dtype_report(model)
 
-        # schedule = optax.warmup_cosine_decay_schedule(
-        #     init_value=0.0,
-        #     peak_value=cfg.learning_rate,
-        #     warmup_steps=cfg.warmup_steps,
-        #     decay_steps=cfg.max_steps - cfg.warmup_steps,
-        #     end_value=cfg.learning_rate * cfg.lr_end_ratio,
-        # )
-        schedule = trapezoidal_schedule(cfg)
+        if cfg.lr_schedule == LRSchedule.COSINE:
+            schedule = optax.warmup_cosine_decay_schedule(
+                init_value=0.0,
+                peak_value=cfg.learning_rate,
+                warmup_steps=cfg.warmup_steps,
+                decay_steps=cfg.max_steps - cfg.warmup_steps,
+                end_value=cfg.learning_rate * cfg.lr_end_ratio,
+            )
+        elif cfg.lr_schedule == LRSchedule.TRAPEZOIDAL:
+            schedule = trapezoidal_schedule(cfg)
+        else:
+            raise ValueError(f"Unknown lr_schedule: {cfg.lr_schedule}")
 
         def decay_mask(params):
             return jax.tree_util.tree_map(lambda p: p.ndim >= 2, params)
 
         tx = optax.chain(
-            optax.clip_by_global_norm(1.0),
+            # Remove gradient clipping for faster gradient propagation.
+            # optax.clip_by_global_norm(1.0),
             optax.adamw(
                 schedule,
                 b1=0.9,
@@ -234,16 +237,12 @@ if __name__ == "__main__":
             wrt=nnx.Param,
         )
 
-        # ── Checkpointing ────────────────────────────────────────────────────────
-
         ckpt_mngr = build_checkpoint_manager(cfg)
 
         # Resume from checkpoint if configured.
         start_step = restore_from_checkpoint(
             cfg, ckpt_mngr, model, optimizer, train_iter
         )
-
-        # ── Training loop ────────────────────────────────────────────────────────
 
         last_val_loss = float("inf")  # track for checkpointing metrics
 
@@ -256,12 +255,8 @@ if __name__ == "__main__":
         for micro_step, batch in enumerate(
             train_iter, start=start_step * cfg.grad_acc_steps
         ):
-            if micro_step >= cfg.max_steps * cfg.grad_acc_steps:
-                break
+            global_step = align_acc_step(micro_step, cfg.grad_acc_steps)
 
-            eff_step = align_acc_step(micro_step, cfg.grad_acc_steps)
-
-            # Validation evaluation / Checkpointing
             if micro_step % (cfg.val_check_steps * cfg.grad_acc_steps) == 0:
                 val_loss = last_val_loss
                 if val_loader is not None:
@@ -269,8 +264,6 @@ if __name__ == "__main__":
                     val_loss_accum = 0.0
                     val_steps = 0
 
-                    # Each iter() call restarts from the beginning of the val split
-                    # (num_epochs=1 in the val loader).
                     for val_batch in iter(val_loader):
                         if val_steps >= cfg.val_max_steps:
                             break
@@ -298,7 +291,7 @@ if __name__ == "__main__":
                     )
                     last_val_loss = val_loss
                     print(
-                        f"step {eff_step:4d} | validation loss {val_loss:.4f} | val_time {val_dt * 1000:.2f} ms | val_tokens/sec {val_tokens_per_sec:.2f}"
+                        f"step {global_step:4d} | validation loss {val_loss:.4f} | val_time {val_dt * 1000:.2f} ms | val_tokens/sec {val_tokens_per_sec:.2f}"
                     )
                     run.log(
                         {
@@ -306,17 +299,16 @@ if __name__ == "__main__":
                             "val_time_ms": val_dt * 1000,
                             "val_tokens_per_sec": val_tokens_per_sec,
                         },
-                        step=eff_step,
+                        step=global_step,
                     )
 
-                # ── Checkpoint (async) ───────────────────────────────────────
-                if eff_step > 0 and eff_step % cfg.ckpt_every_steps == 0:
+                if global_step > 0 and global_step % cfg.ckpt_every_steps == 0:
                     wandb_run = run if not isinstance(wandb, MockWandb) else None
                     save_checkpoint(
                         ckpt_mngr,
                         model,
                         optimizer,
-                        eff_step,
+                        global_step,
                         val_loss,
                         cfg,
                         train_iter,
@@ -325,6 +317,9 @@ if __name__ == "__main__":
 
                 # Reset timer so validation time doesn't pollute training throughput
                 t0 = time.time()
+
+            if micro_step >= cfg.max_steps * cfg.grad_acc_steps:
+                break
 
             # Shard training batch along the data mesh dimension
             x_sharded = jax.device_put(batch["x"], NamedSharding(mesh, P("data", None)))
@@ -345,17 +340,16 @@ if __name__ == "__main__":
                         "loss": loss.item(),
                         "step_time_ms": dt * 1000,
                         "tokens_per_sec": tokens_per_sec,
-                        "learning_rate": schedule(eff_step).item(),
+                        "learning_rate": schedule(global_step).item(),
                         "total_tokens": total_tokens,
                     },
-                    step=eff_step,
+                    step=global_step,
                 )
                 print(
-                    f"step {eff_step:4d} | loss {loss:.4f} | lr: {schedule(eff_step):.4f} | time {dt * 1000:.2f} ms | tokens/sec {tokens_per_sec:.2f} | tokens {total_tokens}"
+                    f"step {global_step:4d} | loss {loss:.4f} | lr: {schedule(global_step):.4f} | time {dt * 1000:.2f} ms | tokens/sec {tokens_per_sec:.2f} | tokens {total_tokens}"
                 )
                 t0 = time.time()
 
-        # ── Cleanup ──────────────────────────────────────────────────────────────
         ckpt_mngr.wait_until_finished()
         ckpt_mngr.close()
         run.finish()

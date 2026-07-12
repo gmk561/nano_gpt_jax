@@ -50,13 +50,28 @@ from attention import (
     MultiHeadAttention,
     MemoryEfficientAttention,
 )  # noqa: F401
+from config import ActivationType
 
 
 # ── Model modules ──────────────────────────────────────────────────────────────
 
 
+def relu_squared(x: jnp.ndarray) -> jnp.ndarray:
+    return jnp.square(nnx.relu(x.astype(jnp.float32))).astype(x.dtype)
+
+
+def get_activation_fn(activation: ActivationType | str):
+    activation = ActivationType(activation)
+    if activation == ActivationType.GELU:
+        return nnx.gelu
+    elif activation == ActivationType.RELU_SQUARED:
+        return relu_squared
+    else:
+        raise ValueError(f"Unknown activation type: {activation}")
+
+
 class MLP(nnx.Module):
-    def __init__(self, config: "ConfigDict", rngs: nnx.Rngs):
+    def __init__(self, config: ConfigDict, rngs: nnx.Rngs):
         self.config = config
         init_fn = nnx.initializers.normal(stddev=0.02)
         # Sharding: (None, None) = fully replicated for data parallelism.
@@ -82,8 +97,10 @@ class MLP(nnx.Module):
             bias_metadata={"out_sharding": (None,)},
         )
 
+        self.activation = get_activation_fn(config.activation)
+
     def __call__(self, x: jnp.ndarray):
-        return self.linear_2(nnx.gelu(self.linear_1(x)))
+        return self.linear_2(self.activation(self.linear_1(x)))
 
 
 class RoPE(nnx.Module):
@@ -104,7 +121,7 @@ class RoPE(nnx.Module):
     def _rotate_half(self, x: jnp.ndarray) -> jnp.ndarray:
         """Rotate pairs of features by 90°: (x1, x2) → (−x2, x1)."""
         x_perm = x.reshape(x.shape[:-1] + (-1, 2))
-        rotated = jnp.stack([-x_perm[..., 1], x_perm[..., 0]], axis=-1)
+        rotated = jnp.stack([-x_perm[..., 1], x_perm[...,]], axis=-1)
         return rotated.reshape(x.shape)
 
     def __call__(self, x: jnp.ndarray, position_axis: int = 1):
@@ -112,8 +129,8 @@ class RoPE(nnx.Module):
         T = x.shape[position_axis]
         D = x.shape[-1]
 
-        rope_cos = self.cos_table[:T, :D].astype(input_dtype)
-        rope_sin = self.sin_table[:T, :D].astype(input_dtype)
+        rope_cos = self.cos_table[:T, :D]
+        rope_sin = self.sin_table[:T, :D]
 
         broadcast_shape = [1] * x.ndim
         broadcast_shape[position_axis] = T
@@ -122,7 +139,8 @@ class RoPE(nnx.Module):
         rope_cos = jnp.reshape(rope_cos, broadcast_shape)
         rope_sin = jnp.reshape(rope_sin, broadcast_shape)
 
-        return x * rope_cos + self._rotate_half(x) * rope_sin
+        x = x * rope_cos + self._rotate_half(x) * rope_sin
+        return x.astype(input_dtype)
 
 
 class Block(nnx.Module):
@@ -295,9 +313,6 @@ def dtype_report(model: nnx.Module):
                 dtype = param[...].dtype
                 if dtype == jnp.float32:
                     print(f"{path} {attr} {dtype}")
-
-
-# ── Loss and step functions ────────────────────────────────────────────────────
 
 
 def loss_fn(model: GPT, x: jnp.ndarray, y: jnp.ndarray):
