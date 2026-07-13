@@ -64,9 +64,9 @@ def get_config() -> ConfigDict:
     cfg.model = ConfigDict()
     cfg.model.max_seq_len = cfg.sequence_length
     cfg.model.vocab_size = -1
-    cfg.model.n_layer = 6
-    cfg.model.n_head = 6
-    cfg.model.n_embd = 384
+    cfg.model.n_layer = 12
+    cfg.model.n_head = 12
+    cfg.model.n_embd = 768
     cfg.model.param_dtype = jnp.bfloat16 if cfg.apply_dtype_policy else jnp.float32
     cfg.model.compute_dtype = jnp.bfloat16 if cfg.apply_dtype_policy else jnp.float32
     cfg.model.accum_dtype = jnp.float32
