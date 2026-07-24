@@ -52,9 +52,6 @@ from attention import (
 from config import ActivationType
 
 
-# ── Model modules ──────────────────────────────────────────────────────────────
-
-
 def relu_squared(x: jnp.ndarray) -> jnp.ndarray:
     return jnp.square(nnx.relu(x.astype(jnp.float32))).astype(x.dtype)
 
@@ -75,7 +72,6 @@ class RMSNorm(nnx.Module):
         self.eps = eps
         self.weight = nnx.Param(jnp.ones((dim,), dtype=jnp.float32))
 
-
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x_dtype = x.dtype
         x_fp32 = x.astype(jnp.float32)
@@ -89,13 +85,10 @@ class RMSNorm(nnx.Module):
         return output.astype(x.dtype)
 
 
-
 class MLP(nnx.Module):
     def __init__(self, config: ConfigDict, rngs: nnx.Rngs):
         self.config = config
         init_fn = nnx.initializers.normal(stddev=0.02)
-        # Sharding: (None, None) = fully replicated for data parallelism.
-        # For model parallelism later: linear_1 -> (None, 'model'), linear_2 -> ('model', None).
         self.linear_1 = nnx.Linear(
             config.n_embd,
             4 * config.n_embd,
@@ -234,7 +227,7 @@ class GPT(nnx.Module):
                 )
 
         def _apply(module, parent=None, _attr_name=None):
-            if isinstance(module, nnx.Linear):
+            if isinstance(module, [nnx.Linear, nnx.LinearGeneral]):
                 stddev = (
                     0.02
                     if not _is_residual_output(module, parent, _attr_name)
@@ -287,7 +280,6 @@ class GPT(nnx.Module):
         return logits.astype(self.config.accum_dtype)
 
 
-
 def cast_params(module: nnx.Module, dtype):
     """Cast all float params in a module subtree to dtype."""
 
@@ -303,7 +295,9 @@ def cast_params(module: nnx.Module, dtype):
 
 def apply_dtype_policy(model: nnx.Module, cfg):
     for _, module in model.iter_modules():
-        if isinstance(module, (nnx.MultiHeadAttention, nnx.Linear, nnx.Embed)):
+        if isinstance(
+            module, (nnx.MultiHeadAttention, nnx.Linear, nnx.Embed, nnx.LinearGeneral)
+        ):
             cast_params(module, cfg.param_dtype)
 
 
