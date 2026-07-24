@@ -227,7 +227,7 @@ class GPT(nnx.Module):
                 )
 
         def _apply(module, parent=None, _attr_name=None):
-            if isinstance(module, [nnx.Linear, nnx.LinearGeneral]):
+            if isinstance(module, (nnx.Linear, nnx.LinearGeneral)):
                 stddev = (
                     0.02
                     if not _is_residual_output(module, parent, _attr_name)

@@ -31,20 +31,20 @@ parser.add_argument(
 parser.add_argument(
     "--num-shards",
     type=int,
-    default=None,
+    default=2,
     help="Stop after writing this many shards (default: write all shards).",
 )
 parser.add_argument(
     "--num-steps",
     type=int,
-    default=5000,
+    default=-1,
     help="Number of training steps to download data for. Use -1 to download the whole dataset.",
 )
 args = parser.parse_args()
 
 local_dir = "edu_fineweb10B"
 remote_name = "sample-10BT"
-shard_size = int(5e8)  # 100M tokens per shard, total of 100 shards
+shard_size = int(5e8) 
 
 val_shards = 2 if args.smoke_test else 1
 if args.smoke_test:

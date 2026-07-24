@@ -33,14 +33,14 @@ def get_config() -> ConfigDict:
     cfg.apply_dtype_policy = True
     cfg.sequence_length = 1024
     cfg.num_devices = jax.device_count()
-    cfg.device_batch_size = 128
+    cfg.device_batch_size = 64
     cfg.batch_size = cfg.device_batch_size * cfg.num_devices
     cfg.tokens_per_batch = 524288
     cfg.grad_acc_steps = cfg.tokens_per_batch // (cfg.batch_size * cfg.sequence_length)
     cfg.dataset = "edu_fineweb"  # "input_txt" or "edu_fineweb"
     cfg.val_check_steps = 200  # evaluate validation loss every 100 steps
     cfg.val_max_steps = 50  # max number of batches to use for validation
-    cfg.max_steps = 10000  # total training steps
+    cfg.max_steps = 2000  # total training steps
     cfg.warmup_steps = cfg.max_steps * 0.2
     # cfg.learning_rate = 6e-4
     # cfg.learning_rate = 1e-3
@@ -72,8 +72,7 @@ def get_config() -> ConfigDict:
     cfg.model.accum_dtype = jnp.float32
 
     # Attention implementation: "flash" | "flax" | "classical" | "mem_eff"
-    # See attention.py / AttentionType for details.
-    cfg.model.attention_type = "flash"  # cuDNN on GPU, XLA fallback on CPU
+    cfg.model.attention_type = "flash"
     cfg.model.use_attention_bias = True
     cfg.model.use_rope = True
     cfg.model.activation = ActivationType.RELU_SQUARED.value

@@ -257,7 +257,8 @@ if __name__ == "__main__":
         ):
             global_step = align_acc_step(micro_step, cfg.grad_acc_steps)
 
-            if micro_step % (cfg.val_check_steps * cfg.grad_acc_steps) == 0:
+            is_last_step = micro_step >= cfg.max_steps * cfg.grad_acc_steps
+            if micro_step % (cfg.val_check_steps * cfg.grad_acc_steps) == 0 or is_last_step:
                 val_loss = last_val_loss
                 if val_loader is not None:
                     t_val_start = time.time()
@@ -318,7 +319,7 @@ if __name__ == "__main__":
                 # Reset timer so validation time doesn't pollute training throughput
                 t0 = time.time()
 
-            if micro_step >= cfg.max_steps * cfg.grad_acc_steps:
+            if is_last_step:
                 break
 
             # Shard training batch along the data mesh dimension
