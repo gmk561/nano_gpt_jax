@@ -38,9 +38,9 @@ def get_config() -> ConfigDict:
     cfg.tokens_per_batch = 524288
     cfg.grad_acc_steps = cfg.tokens_per_batch // (cfg.batch_size * cfg.sequence_length)
     cfg.dataset = "edu_fineweb"  # "input_txt" or "edu_fineweb"
-    cfg.val_check_steps = 200  # evaluate validation loss every 100 steps
+    cfg.val_check_steps = 500  # evaluate validation loss every 100 steps
     cfg.val_max_steps = 50  # max number of batches to use for validation
-    cfg.max_steps = 2000  # total training steps
+    cfg.max_steps = 12000   # total training steps
     cfg.warmup_steps = cfg.max_steps * 0.2
     # cfg.learning_rate = 6e-4
     # cfg.learning_rate = 1e-3

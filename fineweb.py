@@ -44,7 +44,7 @@ args = parser.parse_args()
 
 local_dir = "edu_fineweb10B"
 remote_name = "sample-10BT"
-shard_size = int(5e8) 
+shard_size = int(5e9) 
 
 val_shards = 2 if args.smoke_test else 1
 if args.smoke_test:

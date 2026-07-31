@@ -243,6 +243,7 @@ if __name__ == "__main__":
         start_step = restore_from_checkpoint(
             cfg, ckpt_mngr, model, optimizer, train_iter
         )
+        print("Start step: ", start_step)
 
         last_val_loss = float("inf")  # track for checkpointing metrics
 

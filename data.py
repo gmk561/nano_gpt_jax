@@ -178,11 +178,19 @@ class EduFinewebShardSource:
         local_idx = idx - self._cumulative[shard_idx]
 
         if self._cached_shard_idx != shard_idx:
-            self._cached_tokens = np.load(self._shard_paths[shard_idx]).astype(np.int32)
+            # mmap_mode='r' memory-maps the file: the OS pages in only the
+            # regions actually accessed, keeping RAM usage to a tiny fraction
+            # of the full shard (~10 GB as uint16 on disk).  Critically, we
+            # do NOT convert the whole array to int32 here — that would
+            # materialise 20 GB per worker process and trigger the OOM killer.
+            self._cached_tokens = np.load(
+                self._shard_paths[shard_idx], mmap_mode="r"
+            )
             self._cached_shard_idx = shard_idx
 
         start = local_idx * self._seq_len
-        buf = self._cached_tokens[start : start + self._seq_len + 1]
+        # Slice first (tiny copy), then cast to int32 — only seq_len+1 elements.
+        buf = self._cached_tokens[start : start + self._seq_len + 1].astype(np.int32)
         return {"x": buf[:-1].copy(), "y": buf[1:].copy()}
 
 
@@ -393,7 +401,7 @@ def create_train_loader(
     sampler = grain.IndexSampler(
         len(source),
         shard_options=grain.ShardByJaxProcess(drop_remainder=True),
-        shuffle=True,
+        shuffle=False,
         num_epochs=None,
         seed=seed,
     )
