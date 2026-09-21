@@ -27,6 +27,7 @@ class ActivationType(StrEnum):
 
 class OptimizerType(StrEnum):
     ADAMW = "adamw"
+    MUON = "muon"
 
 
 def get_config() -> ConfigDict:

@@ -59,7 +59,7 @@ from model import (
     train_step,
     val_step,
 )
-from optimizer import build_optimizer
+from optimizer import build_optimizer, print_optimizer_params
 
 
 _CONFIGS = {
@@ -179,6 +179,7 @@ if __name__ == "__main__":
         dtype_report(model)
 
         optimizer, schedule = build_optimizer(model, cfg)
+        print_optimizer_params(model, cfg)
 
         ckpt_mngr = build_checkpoint_manager(cfg)
 

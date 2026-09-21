@@ -138,6 +138,175 @@ def build_adamw(
     )
 
 
+def make_muon_weight_dimension_numbers(params: Any) -> Any:
+    """Dimension numbers mask that applies Muon only to matrices (excluding biases, heads, and embeddings).
+
+    Parameters for which this function returns None fall back to Adam in :func:`optax.contrib.muon`.
+
+    Parameters
+    ----------
+    params:
+        The PyTree of model parameters.
+
+    Returns
+    -------
+    A PyTree with the same structure as ``params``, where internal 2D weight
+    matrices map to :class:`optax.contrib.MuonDimensionNumbers` and biases,
+    embeddings, output heads, and non-2D tensors map to ``None``.
+    """
+    def leaf_fn(path, val):
+        # Biases, layernorms, scales, scalars (ndim < 2) -> Adam
+        if getattr(val, "ndim", 0) < 2:
+            return None
+
+        # Extract path components as lowercase strings
+        path_parts = []
+        for p in path:
+            if hasattr(p, "key"):
+                path_parts.append(str(p.key).lower())
+            elif hasattr(p, "name"):
+                path_parts.append(str(p.name).lower())
+            elif hasattr(p, "idx"):
+                path_parts.append(str(p.idx).lower())
+            else:
+                path_parts.append(str(p).lower())
+
+        # Exclude embeddings (e.g. wte, wpe, embed, embedding)
+        if any(
+            part in ("wte", "wpe", "embed", "embedding", "embeddings")
+            or "embed" in part
+            or "wte" in part
+            or "wpe" in part
+            for part in path_parts
+        ):
+            return None
+
+        # Exclude heads (e.g. lm_head, output_head, head)
+        if any(
+            part in ("lm_head", "output_head", "head")
+            or "lm_head" in part
+            or part.endswith("_head")
+            for part in path_parts
+        ):
+            return None
+
+        return optax.contrib.MuonDimensionNumbers()
+
+    return jax.tree_util.tree_map_with_path(leaf_fn, params)
+
+
+
+
+muon_weight_dimension_numbers = make_muon_weight_dimension_numbers
+
+
+@register_optimizer(OptimizerType.MUON)
+def build_muon(
+    schedule: optax.Schedule,
+    *,
+    ns_steps: int = 5,
+    beta: float = 0.95,
+    weight_decay: float = 0.0,
+    nesterov: bool = True,
+    muon_weight_dimension_numbers: Any | None = make_muon_weight_dimension_numbers,
+    **kwargs,
+) -> optax.GradientTransformation:
+    """Muon optimizer builder using optax.contrib.muon.
+
+    Implements Keller Jordan's Muon optimizer (MomentUm Orthogonalized by Newton-schulz).
+    By default, applies Muon only to 2D hidden weight matrices, while biases,
+    embedding matrices, and output heads are optimized with AdamW.
+    """
+    if "momentum" in kwargs:
+        beta = kwargs["momentum"]
+    if muon_weight_dimension_numbers is None:
+        muon_weight_dimension_numbers = make_muon_weight_dimension_numbers
+
+    return optax.contrib.muon(
+        learning_rate=schedule,
+        ns_steps=ns_steps,
+        beta=beta,
+        weight_decay=weight_decay,
+        nesterov=nesterov,
+        muon_weight_dimension_numbers=muon_weight_dimension_numbers,
+    )
+
+
+def print_optimizer_params(model: nnx.Module, cfg: ConfigDict) -> None:
+    """Print out each model parameter, its shape, and which optimizer updates it.
+
+    Parameters
+    ----------
+    model:
+        The Flax NNX model containing parameters.
+    cfg:
+        Configuration dict with optimizer configuration.
+    """
+    opt_cfg = getattr(cfg, "optimizer", ConfigDict())
+    opt_type = str(opt_cfg.get("type", OptimizerType.ADAMW.value)).lower()
+
+    params = nnx.state(model, nnx.Param)
+    leaves_params = jax.tree_util.tree_leaves_with_path(params)
+
+    if not leaves_params:
+        print("No parameters found in model.")
+        return
+
+    print("\n" + "=" * 80)
+    print(f"Optimizer Parameter Assignment (Configured: {opt_type.upper()})")
+    print("-" * 80)
+    print(f"{'Parameter':<48} {'Shape':<18} {'Optimizer':<12}")
+    print("-" * 80)
+
+    muon_counts = 0
+    muon_elements = 0
+    other_counts = 0
+    other_elements = 0
+    other_opt_name = "AdamW" if opt_type == "muon" else opt_type.capitalize()
+
+    if opt_type == "muon":
+        mask = make_muon_weight_dimension_numbers(params)
+        is_leaf = lambda x: x is None or isinstance(x, optax.contrib.MuonDimensionNumbers)
+        leaves_mask = jax.tree_util.tree_leaves_with_path(mask, is_leaf=is_leaf)
+    else:
+        leaves_mask = [(None, None)] * len(leaves_params)
+
+    for (path, val), (_, m_val) in zip(leaves_params, leaves_mask):
+        path_tokens = []
+        for x in path:
+            k = str(getattr(x, "key", getattr(x, "name", getattr(x, "idx", x))))
+            if k != "value":
+                path_tokens.append(k)
+        param_name = ".".join(path_tokens)
+        shape_str = str(getattr(val, "shape", ()))
+
+        if opt_type == "muon":
+            assigned_opt = "Muon" if m_val is not None else "AdamW"
+        else:
+            assigned_opt = other_opt_name
+
+        if assigned_opt == "Muon":
+            muon_counts += 1
+            muon_elements += getattr(val, "size", 0)
+        else:
+            other_counts += 1
+            other_elements += getattr(val, "size", 0)
+
+        print(f"{param_name:<48} {shape_str:<18} {assigned_opt:<12}")
+
+    total_params = muon_elements + other_elements
+    print("-" * 80)
+    if opt_type == "muon":
+        print(
+            f"Total: {len(leaves_params)} tensors ({total_params:,} params) | "
+            f"Muon: {muon_counts} tensors ({muon_elements:,} params) | "
+            f"AdamW: {other_counts} tensors ({other_elements:,} params)"
+        )
+    else:
+        print(f"Total: {len(leaves_params)} tensors ({total_params:,} params) -> all using {other_opt_name}")
+    print("=" * 80 + "\n")
+
+
 def build_optimizer_tx(
     cfg: ConfigDict,
     schedule: optax.Schedule,

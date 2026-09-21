@@ -23,10 +23,14 @@ from optimizer import (
     OPTIMIZER_REGISTRY,
     build_adamw,
     build_lr_schedule,
+    build_muon,
     build_optimizer,
     build_optimizer_tx,
     decay_mask,
     get_optimizer_builder,
+    make_muon_weight_dimension_numbers,
+    muon_weight_dimension_numbers,
+    print_optimizer_params,
     register_optimizer,
 )
 
@@ -86,6 +90,157 @@ def test_build_default_adamw_tx():
     sched = build_lr_schedule(cfg)
     tx = build_optimizer_tx(cfg, sched)
     assert hasattr(tx, "init") and hasattr(tx, "update")
+
+
+def test_muon_registered_by_default():
+    builder = get_optimizer_builder(OptimizerType.MUON)
+    assert callable(builder)
+    assert builder is build_muon
+
+
+def test_muon_step_dummy_input():
+    # 1. Verify build_optimizer_tx with OptimizerType.MUON
+    cfg = get_cpu_test_config()
+    cfg.optimizer.type = OptimizerType.MUON.value
+    schedule = optax.constant_schedule(1e-3)
+    tx = build_optimizer_tx(cfg, schedule)
+    assert hasattr(tx, "init") and hasattr(tx, "update")
+
+    # 2. Setup dummy parameters (2D matrix for Muon orthogonalization, 1D vector for Adam)
+    params = {
+        "layer": {
+            "weight": jnp.ones((16, 8)),
+            "bias": jnp.zeros((8,)),
+        }
+    }
+    grads = {
+        "layer": {
+            "weight": jnp.ones((16, 8)) * 0.1,
+            "bias": jnp.ones((8,)) * 0.1,
+        }
+    }
+
+    state = tx.init(params)
+
+    # 3. Test compilation (jax.jit) and applying one step of dummy input
+    @jax.jit
+    def step_fn(p, s, g):
+        updates, new_s = tx.update(g, s, p)
+        new_p = optax.apply_updates(p, updates)
+        return new_p, new_s
+
+    new_params, new_state = step_fn(params, state, grads)
+
+    # 4. Sanity checks on shapes, validity, and actual parameter updates
+    assert new_params["layer"]["weight"].shape == params["layer"]["weight"].shape
+    assert new_params["layer"]["bias"].shape == params["layer"]["bias"].shape
+    assert not jnp.isnan(new_params["layer"]["weight"]).any()
+    assert not jnp.isnan(new_params["layer"]["bias"]).any()
+    assert not jnp.isinf(new_params["layer"]["weight"]).any()
+    assert not jnp.isinf(new_params["layer"]["bias"]).any()
+    assert not jnp.allclose(new_params["layer"]["weight"], params["layer"]["weight"])
+    assert not jnp.allclose(new_params["layer"]["bias"], params["layer"]["bias"])
+
+
+def test_muon_weight_dimension_numbers_mask():
+    params = {
+        "blocks": {
+            "0": {
+                "attn": {"kernel": jnp.ones((16, 16)), "bias": jnp.zeros((16,))},
+                "mlp": {"kernel": jnp.ones((16, 64)), "bias": jnp.zeros((64,))},
+            }
+        },
+        "wte": {"embedding": jnp.ones((100, 16))},
+        "wpe": {"embedding": jnp.ones((32, 16))},
+        "lm_head": {"kernel": jnp.ones((16, 100))},
+        "ln_f": {"scale": jnp.ones((16,))},
+    }
+
+    mask = muon_weight_dimension_numbers(params)
+
+    # 2D hidden matrix weights should have MuonDimensionNumbers
+    assert isinstance(mask["blocks"]["0"]["attn"]["kernel"], optax.contrib.MuonDimensionNumbers)
+    assert isinstance(mask["blocks"]["0"]["mlp"]["kernel"], optax.contrib.MuonDimensionNumbers)
+
+    # Biases and 1D scales should be None (optimized with Adam)
+    assert mask["blocks"]["0"]["attn"]["bias"] is None
+    assert mask["blocks"]["0"]["mlp"]["bias"] is None
+    assert mask["ln_f"]["scale"] is None
+
+    # Embeddings and output heads should be None (optimized with Adam)
+    assert mask["wte"]["embedding"] is None
+    assert mask["wpe"]["embedding"] is None
+    assert mask["lm_head"]["kernel"] is None
+
+
+def test_muon_dimension_numbers_selective_updates():
+    schedule = optax.constant_schedule(1e-3)
+    # build_muon uses muon_weight_dimension_numbers by default
+    tx = build_muon(schedule)
+
+    params = {
+        "blocks": {
+            "0": {
+                "mlp": {"w": jnp.ones((8, 16)), "b": jnp.zeros((16,))},
+            }
+        },
+        "wte": {"embedding": jnp.ones((64, 8))},
+        "lm_head": {"kernel": jnp.ones((8, 64))},
+    }
+    grads = jax.tree_util.tree_map(lambda x: jnp.ones_like(x) * 0.05, params)
+
+    state = tx.init(params)
+
+    @jax.jit
+    def step_fn(p, s, g):
+        updates, new_s = tx.update(g, s, p)
+        new_p = optax.apply_updates(p, updates)
+        return new_p, new_s
+
+    new_params, new_state = step_fn(params, state, grads)
+
+    # Ensure all parameter groups are updated without NaNs
+    for path, leaf in jax.tree_util.tree_leaves_with_path(new_params):
+        assert not jnp.isnan(leaf).any()
+
+    # Matrix weights in blocks receive Muon updates
+    assert not jnp.allclose(new_params["blocks"]["0"]["mlp"]["w"], params["blocks"]["0"]["mlp"]["w"])
+    # Biases receive Adam updates
+    assert not jnp.allclose(new_params["blocks"]["0"]["mlp"]["b"], params["blocks"]["0"]["mlp"]["b"])
+    # Embeddings receive Adam updates
+    assert not jnp.allclose(new_params["wte"]["embedding"], params["wte"]["embedding"])
+    # Heads receive Adam updates
+    assert not jnp.allclose(new_params["lm_head"]["kernel"], params["lm_head"]["kernel"])
+
+
+def test_print_optimizer_params(capsys):
+    class DummyBlock(nnx.Module):
+        def __init__(self, rngs):
+            self.linear = nnx.Linear(8, 16, rngs=rngs)
+
+    class DummyModel(nnx.Module):
+        def __init__(self, rngs):
+            self.wte = nnx.Embed(32, 8, rngs=rngs)
+            self.block = DummyBlock(rngs)
+            self.lm_head = nnx.Linear(8, 32, use_bias=False, rngs=rngs)
+
+    model = DummyModel(nnx.Rngs(0))
+
+    cfg = get_cpu_test_config()
+    cfg.optimizer.type = OptimizerType.MUON.value
+
+    print_optimizer_params(model, cfg)
+    captured = capsys.readouterr().out
+    assert "Optimizer Parameter Assignment (Configured: MUON)" in captured
+    assert "Muon" in captured
+    assert "AdamW" in captured
+
+    cfg.optimizer.type = OptimizerType.ADAMW.value
+    print_optimizer_params(model, cfg)
+    captured_adam = capsys.readouterr().out
+    assert "Optimizer Parameter Assignment (Configured: ADAMW)" in captured_adam
+
+
 
 
 def test_custom_optimizer_registration():
