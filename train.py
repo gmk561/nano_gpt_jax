@@ -39,7 +39,6 @@ import time
 
 import jax
 import jax.numpy as jnp
-import optax
 from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -50,7 +49,7 @@ from checkpoint import (
     restore_from_checkpoint,
     save_checkpoint,
 )
-from config import LRSchedule, get_config, get_cpu_test_config, get_mem_eff_config
+from config import get_config, get_cpu_test_config, get_mem_eff_config
 from data import GPT2_VOCAB_SIZE, create_train_loader, create_val_loader
 from model import (
     GPT,
@@ -60,6 +59,7 @@ from model import (
     train_step,
     val_step,
 )
+from optimizer import build_optimizer
 
 
 _CONFIGS = {
@@ -140,25 +140,6 @@ else:
 _accelerator_backends = {"gpu", "tpu"}
 
 
-def trapezoidal_schedule(config):
-    warmup_schedule = optax.linear_schedule(
-        init_value=0.0,
-        end_value=config.learning_rate,
-        transition_steps=config.warmup_steps,
-    )
-    plateau_schedule = optax.constant_schedule(value=config.learning_rate)
-    decay_schedule = optax.linear_schedule(
-        init_value=config.learning_rate,
-        transition_steps=config.warmup_steps,
-        end_value=0.0,
-    )
-
-    return optax.join_schedules(
-        schedules=[warmup_schedule, plateau_schedule, decay_schedule],
-        boundaries=[config.warmup_steps, config.max_steps - config.warmup_steps],
-    )
-
-
 if __name__ == "__main__":
     args = _parse_args()
 
@@ -197,45 +178,7 @@ if __name__ == "__main__":
 
         dtype_report(model)
 
-        if cfg.lr_schedule == LRSchedule.COSINE:
-            schedule = optax.warmup_cosine_decay_schedule(
-                init_value=0.0,
-                peak_value=cfg.learning_rate,
-                warmup_steps=cfg.warmup_steps,
-                decay_steps=cfg.max_steps - cfg.warmup_steps,
-                end_value=cfg.learning_rate * cfg.lr_end_ratio,
-            )
-        elif cfg.lr_schedule == LRSchedule.TRAPEZOIDAL:
-            schedule = trapezoidal_schedule(cfg)
-        else:
-            raise ValueError(f"Unknown lr_schedule: {cfg.lr_schedule}")
-
-        def decay_mask(params):
-            return jax.tree_util.tree_map(lambda p: p.ndim >= 2, params)
-
-        tx = optax.chain(
-            # Remove gradient clipping for faster gradient propagation.
-            # optax.clip_by_global_norm(1.0),
-            optax.adamw(
-                schedule,
-                b1=0.9,
-                b2=0.95,
-                eps=1e-8,
-                weight_decay=0.1,
-                mask=decay_mask,
-            ),
-        )
-
-        if cfg.grad_acc_steps > 1:
-            tx = optax.MultiSteps(
-                tx, every_k_schedule=cfg.grad_acc_steps, use_grad_mean=True
-            )
-
-        optimizer = nnx.Optimizer(
-            model,
-            tx,
-            wrt=nnx.Param,
-        )
+        optimizer, schedule = build_optimizer(model, cfg)
 
         ckpt_mngr = build_checkpoint_manager(cfg)
 
@@ -259,7 +202,10 @@ if __name__ == "__main__":
             global_step = align_acc_step(micro_step, cfg.grad_acc_steps)
 
             is_last_step = micro_step >= cfg.max_steps * cfg.grad_acc_steps
-            if micro_step % (cfg.val_check_steps * cfg.grad_acc_steps) == 0 or is_last_step:
+            if (
+                micro_step % (cfg.val_check_steps * cfg.grad_acc_steps) == 0
+                or is_last_step
+            ):
                 val_loss = last_val_loss
                 if val_loader is not None:
                     t_val_start = time.time()

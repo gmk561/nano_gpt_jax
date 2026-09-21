@@ -25,8 +25,21 @@ class ActivationType(StrEnum):
     RELU_SQUARED = "relu^2"
 
 
+class OptimizerType(StrEnum):
+    ADAMW = "adamw"
+
+
 def get_config() -> ConfigDict:
     cfg = ConfigDict()
+    # Optimizer config
+    cfg.optimizer = ConfigDict()
+    cfg.optimizer.type = OptimizerType.ADAMW.value
+    cfg.optimizer.b1 = 0.9
+    cfg.optimizer.b2 = 0.95
+    cfg.optimizer.eps = 1e-8
+    cfg.optimizer.weight_decay = 0.1
+    cfg.optimizer.clip_by_global_norm = None
+
     # Mixed precision: use bfloat16 for faster computation, weights remain float32,
     # activations are bfloat16. Don't apply to LayerNorm as it sums many values —
     # this can lead to overflow or underflow.
