@@ -150,16 +150,16 @@ def make_muon_weight_dimension_numbers(params: Any) -> Any:
 
     Returns
     -------
-    A PyTree with the same structure as ``params``, where internal 2D weight
+    A PyTree with the same structure as ``params``, where internal weight
     matrices map to :class:`optax.contrib.MuonDimensionNumbers` and biases,
-    embeddings, output heads, and non-2D tensors map to ``None``.
+    embeddings, output heads, and non-matrix tensors map to ``None``.
     """
     def leaf_fn(path, val):
         # Biases, layernorms, scales, scalars (ndim < 2) -> Adam
         if getattr(val, "ndim", 0) < 2:
             return None
 
-        # Extract path components as lowercase strings
+        # Extract path components as lowercase strings (strip trailing NNX '.value')
         path_parts = []
         for p in path:
             if hasattr(p, "key"):
@@ -170,10 +170,16 @@ def make_muon_weight_dimension_numbers(params: Any) -> Any:
                 path_parts.append(str(p.idx).lower())
             else:
                 path_parts.append(str(p).lower())
+        if path_parts and path_parts[-1] == "value":
+            path_parts = path_parts[:-1]
 
-        # Exclude embeddings (e.g. wte, wpe, embed, embedding)
+        # 1. Skip biases (e.g. 1D biases or 2D attention biases like (num_heads, head_dim))
+        if any("bias" in part for part in path_parts):
+            return None
+
+        # 2. Skip embedding token projections (e.g. wte, wpe, embed, embedding)
         if any(
-            part in ("wte", "wpe", "embed", "embedding", "embeddings")
+            part in ("wte", "wpe", "embed", "embedding", "embeddings", "token_emb")
             or "embed" in part
             or "wte" in part
             or "wpe" in part
@@ -181,16 +187,32 @@ def make_muon_weight_dimension_numbers(params: Any) -> Any:
         ):
             return None
 
-        # Exclude heads (e.g. lm_head, output_head, head)
+        # 3. Skip LM heads / output prediction heads (e.g. lm_head, output_head, head)
         if any(
-            part in ("lm_head", "output_head", "head")
+            part in ("lm_head", "output_head", "head", "unembed", "logits")
             or "lm_head" in part
             or part.endswith("_head")
             for part in path_parts
         ):
             return None
 
-        return optax.contrib.MuonDimensionNumbers()
+        # 4. Standard 2D matrix weights (e.g. MLP layers, classical attention projections)
+        if val.ndim == 2:
+            return optax.contrib.MuonDimensionNumbers(reduction_axis=0, output_axis=1)
+
+        # 5. 3D attention projection kernels (Flax / Flash attention)
+        if val.ndim == 3:
+            # Output projection: shape is (num_heads, head_dim, n_embd) -> reduce (0, 1) to out 2
+            if any(part in ("out", "out_proj") for part in path_parts):
+                return optax.contrib.MuonDimensionNumbers(reduction_axis=(0, 1), output_axis=2)
+            # Query, Key, Value projections: shape is (n_embd, num_heads, head_dim) -> reduce 0 to out (1, 2)
+            if any(
+                part in ("query", "key", "value", "q_proj", "k_proj", "v_proj")
+                for part in path_parts
+            ):
+                return optax.contrib.MuonDimensionNumbers(reduction_axis=0, output_axis=(1, 2))
+
+        return None
 
     return jax.tree_util.tree_map_with_path(leaf_fn, params)
 
@@ -214,22 +236,38 @@ def build_muon(
     """Muon optimizer builder using optax.contrib.muon.
 
     Implements Keller Jordan's Muon optimizer (MomentUm Orthogonalized by Newton-schulz).
-    By default, applies Muon only to 2D hidden weight matrices, while biases,
-    embedding matrices, and output heads are optimized with AdamW.
+    By default, applies Muon only to matrix parameters (excluding biases, embedding token
+    projections, and output heads, which are optimized with AdamW).
     """
     if "momentum" in kwargs:
         beta = kwargs["momentum"]
     if muon_weight_dimension_numbers is None:
         muon_weight_dimension_numbers = make_muon_weight_dimension_numbers
 
-    return optax.contrib.muon(
-        learning_rate=schedule,
-        ns_steps=ns_steps,
-        beta=beta,
-        weight_decay=weight_decay,
-        nesterov=nesterov,
-        muon_weight_dimension_numbers=muon_weight_dimension_numbers,
-    )
+    # Forward any supported extra hyperparameters to optax.contrib.muon
+    muon_kwargs = {
+        "learning_rate": schedule,
+        "ns_steps": ns_steps,
+        "beta": beta,
+        "weight_decay": weight_decay,
+        "nesterov": nesterov,
+        "muon_weight_dimension_numbers": muon_weight_dimension_numbers,
+    }
+    for k in (
+        "adam_learning_rate",
+        "adam_b1",
+        "adam_b2",
+        "adam_weight_decay",
+        "adam_eps_root",
+        "eps",
+        "mu_dtype",
+        "preconditioning",
+        "consistent_rms",
+    ):
+        if k in kwargs:
+            muon_kwargs[k] = kwargs[k]
+
+    return optax.contrib.muon(**muon_kwargs)
 
 
 def print_optimizer_params(model: nnx.Module, cfg: ConfigDict) -> None:
@@ -272,11 +310,12 @@ def print_optimizer_params(model: nnx.Module, cfg: ConfigDict) -> None:
         leaves_mask = [(None, None)] * len(leaves_params)
 
     for (path, val), (_, m_val) in zip(leaves_params, leaves_mask):
-        path_tokens = []
-        for x in path:
-            k = str(getattr(x, "key", getattr(x, "name", getattr(x, "idx", x))))
-            if k != "value":
-                path_tokens.append(k)
+        path_tokens = [
+            str(getattr(x, "key", getattr(x, "name", getattr(x, "idx", x))))
+            for x in path
+        ]
+        if path_tokens and path_tokens[-1] == "value":
+            path_tokens = path_tokens[:-1]
         param_name = ".".join(path_tokens)
         shape_str = str(getattr(val, "shape", ()))
 

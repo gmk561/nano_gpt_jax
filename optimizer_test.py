@@ -146,7 +146,16 @@ def test_muon_weight_dimension_numbers_mask():
     params = {
         "blocks": {
             "0": {
-                "attn": {"kernel": jnp.ones((16, 16)), "bias": jnp.zeros((16,))},
+                "mha": {
+                    "query": {
+                        "kernel": jnp.ones((16, 2, 8)),
+                        "bias": jnp.zeros((2, 8)),  # 2D bias in multi-head attention
+                    },
+                    "out": {
+                        "kernel": jnp.ones((2, 8, 16)),
+                        "bias": jnp.zeros((16,)),
+                    },
+                },
                 "mlp": {"kernel": jnp.ones((16, 64)), "bias": jnp.zeros((64,))},
             }
         },
@@ -158,19 +167,22 @@ def test_muon_weight_dimension_numbers_mask():
 
     mask = muon_weight_dimension_numbers(params)
 
-    # 2D hidden matrix weights should have MuonDimensionNumbers
-    assert isinstance(mask["blocks"]["0"]["attn"]["kernel"], optax.contrib.MuonDimensionNumbers)
+    # Matrix weights should have MuonDimensionNumbers
+    assert isinstance(mask["blocks"]["0"]["mha"]["query"]["kernel"], optax.contrib.MuonDimensionNumbers)
+    assert isinstance(mask["blocks"]["0"]["mha"]["out"]["kernel"], optax.contrib.MuonDimensionNumbers)
     assert isinstance(mask["blocks"]["0"]["mlp"]["kernel"], optax.contrib.MuonDimensionNumbers)
 
-    # Biases and 1D scales should be None (optimized with Adam)
-    assert mask["blocks"]["0"]["attn"]["bias"] is None
+    # Biases (both 1D and 2D) and 1D scales should be None (optimized with AdamW)
+    assert mask["blocks"]["0"]["mha"]["query"]["bias"] is None
+    assert mask["blocks"]["0"]["mha"]["out"]["bias"] is None
     assert mask["blocks"]["0"]["mlp"]["bias"] is None
     assert mask["ln_f"]["scale"] is None
 
-    # Embeddings and output heads should be None (optimized with Adam)
+    # Embeddings and output heads should be None (optimized with AdamW)
     assert mask["wte"]["embedding"] is None
     assert mask["wpe"]["embedding"] is None
     assert mask["lm_head"]["kernel"] is None
+
 
 
 def test_muon_dimension_numbers_selective_updates():
@@ -326,3 +338,28 @@ def test_full_train_step_with_custom_optimizer():
         loss_0 = train_step(model, optimizer, x, y)
         assert not jnp.isnan(loss_0)
         assert loss_0 > 0.0
+
+
+def test_full_train_step_with_muon():
+    cfg = get_cpu_test_config()
+    cfg.model.vocab_size = 64
+    cfg.optimizer.type = OptimizerType.MUON.value
+
+    mesh = jax.make_mesh((cfg.num_devices, 1), ("data", "model"))
+    with jax.set_mesh(mesh):
+        rngs = nnx.Rngs(42)
+        model = GPT(cfg.model, rngs=rngs)
+
+        optimizer, schedule = build_optimizer(model, cfg)
+
+        B, T = 2, cfg.sequence_length
+        x = jax.random.randint(jax.random.PRNGKey(0), (B, T), 0, cfg.model.vocab_size)
+        y = jax.random.randint(jax.random.PRNGKey(1), (B, T), 0, cfg.model.vocab_size)
+
+        loss_0 = train_step(model, optimizer, x, y)
+        assert not jnp.isnan(loss_0)
+        assert loss_0 > 0.0
+
+        loss_1 = train_step(model, optimizer, x, y)
+        assert not jnp.isnan(loss_1)
+
