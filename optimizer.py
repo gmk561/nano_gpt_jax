@@ -79,16 +79,17 @@ def decay_mask(params: Any) -> Any:
     return jax.tree_util.tree_map(lambda p: p.ndim >= 2, params)
 
 
-def trapezoidal_schedule(config: ConfigDict) -> optax.Schedule:
+def trapezoidal_schedule(config: ConfigDict, learning_rate: float | None = None) -> optax.Schedule:
     """Construct a trapezoidal learning rate schedule."""
+    peak_lr = learning_rate if learning_rate is not None else config.learning_rate
     warmup_schedule = optax.linear_schedule(
         init_value=0.0,
-        end_value=config.learning_rate,
+        end_value=peak_lr,
         transition_steps=config.warmup_steps,
     )
-    plateau_schedule = optax.constant_schedule(value=config.learning_rate)
+    plateau_schedule = optax.constant_schedule(value=peak_lr)
     decay_schedule = optax.linear_schedule(
-        init_value=config.learning_rate,
+        init_value=peak_lr,
         transition_steps=config.warmup_steps,
         end_value=0.0,
     )
@@ -99,19 +100,20 @@ def trapezoidal_schedule(config: ConfigDict) -> optax.Schedule:
     )
 
 
-def build_lr_schedule(cfg: ConfigDict) -> optax.Schedule:
+def build_lr_schedule(cfg: ConfigDict, learning_rate: float | None = None) -> optax.Schedule:
     """Create a learning rate schedule from the provided training configuration."""
     schedule_type = cfg.lr_schedule
+    peak_lr = learning_rate if learning_rate is not None else cfg.learning_rate
     if schedule_type == LRSchedule.COSINE:
         return optax.warmup_cosine_decay_schedule(
             init_value=0.0,
-            peak_value=cfg.learning_rate,
+            peak_value=peak_lr,
             warmup_steps=cfg.warmup_steps,
             decay_steps=cfg.max_steps - cfg.warmup_steps,
-            end_value=cfg.learning_rate * cfg.lr_end_ratio,
+            end_value=peak_lr * cfg.lr_end_ratio,
         )
     elif schedule_type == LRSchedule.TRAPEZOIDAL:
-        return trapezoidal_schedule(cfg)
+        return trapezoidal_schedule(cfg, learning_rate=peak_lr)
     else:
         raise ValueError(f"Unknown lr_schedule: {cfg.lr_schedule}")
 
@@ -120,10 +122,10 @@ def build_lr_schedule(cfg: ConfigDict) -> optax.Schedule:
 def build_adamw(
     schedule: optax.Schedule,
     *,
-    b1: float = 0.9,
+    b1: float = 0.90,
     b2: float = 0.95,
     eps: float = 1e-8,
-    weight_decay: float = 0.1,
+    weight_decay: float = 0.01,
     mask: Any | None = decay_mask,
     **kwargs,
 ) -> optax.GradientTransformation:
@@ -226,6 +228,7 @@ muon_weight_dimension_numbers = make_muon_weight_dimension_numbers
 def build_muon(
     schedule: optax.Schedule,
     *,
+    cfg: ConfigDict | None = None,
     ns_steps: int = 5,
     beta: float = 0.95,
     weight_decay: float = 0.0,
@@ -241,6 +244,12 @@ def build_muon(
     """
     if "momentum" in kwargs:
         beta = kwargs["momentum"]
+    elif "beta" in kwargs:
+        beta = kwargs["beta"]
+
+    if "muon_weight_decay" in kwargs:
+        weight_decay = kwargs["muon_weight_decay"]
+
     if muon_weight_dimension_numbers is None:
         muon_weight_dimension_numbers = make_muon_weight_dimension_numbers
 
@@ -253,11 +262,31 @@ def build_muon(
         "nesterov": nesterov,
         "muon_weight_dimension_numbers": muon_weight_dimension_numbers,
     }
+
+    # AdamW hyperparameters for non-matrix parameters (embeddings, heads, biases, RMSNorm scales)
+    adam_b1 = kwargs.get("adam_b1", kwargs.get("b1", 0.90))
+    adam_b2 = kwargs.get("adam_b2", kwargs.get("b2", 0.95))
+    adam_wd = kwargs.get("adam_weight_decay", kwargs.get("weight_decay", 0.01))
+    muon_kwargs["adam_b1"] = adam_b1
+    muon_kwargs["adam_b2"] = adam_b2
+    muon_kwargs["adam_weight_decay"] = adam_wd
+
+    # Auxiliary AdamW learning rate (defaults to 3e-4, scheduled across training steps if cfg available)
+    adam_lr = kwargs.get("adam_learning_rate", None)
+    if adam_lr is None and cfg is not None:
+        opt_cfg = getattr(cfg, "optimizer", ConfigDict())
+        adam_lr = getattr(opt_cfg, "adam_learning_rate", 3e-4)
+
+    if adam_lr is not None:
+        if callable(adam_lr):
+            muon_kwargs["adam_learning_rate"] = adam_lr
+        elif isinstance(adam_lr, (int, float)):
+            if cfg is not None:
+                muon_kwargs["adam_learning_rate"] = build_lr_schedule(cfg, learning_rate=float(adam_lr))
+            else:
+                muon_kwargs["adam_learning_rate"] = float(adam_lr)
+
     for k in (
-        "adam_learning_rate",
-        "adam_b1",
-        "adam_b2",
-        "adam_weight_decay",
         "adam_eps_root",
         "eps",
         "mu_dtype",
@@ -293,6 +322,24 @@ def print_optimizer_params(model: nnx.Module, cfg: ConfigDict) -> None:
     print("\n" + "=" * 80)
     print(f"Optimizer Parameter Assignment (Configured: {opt_type.upper()})")
     print("-" * 80)
+    if opt_type == "muon":
+        muon_lr = getattr(opt_cfg, "muon_learning_rate", getattr(cfg, "learning_rate", 0.02))
+        momentum = getattr(opt_cfg, "momentum", getattr(opt_cfg, "beta", 0.95))
+        muon_wd = getattr(opt_cfg, "muon_weight_decay", 0.0)
+        adam_lr = getattr(opt_cfg, "adam_learning_rate", 3e-4)
+        adam_b1 = getattr(opt_cfg, "adam_b1", getattr(opt_cfg, "b1", 0.90))
+        adam_b2 = getattr(opt_cfg, "adam_b2", getattr(opt_cfg, "b2", 0.95))
+        adam_wd = getattr(opt_cfg, "adam_weight_decay", getattr(opt_cfg, "weight_decay", 0.01))
+        print(f"Muon:  lr={muon_lr}, momentum={momentum}, weight_decay={muon_wd}")
+        print(f"AdamW: lr={adam_lr}, betas=({adam_b1}, {adam_b2}), weight_decay={adam_wd}")
+        print("-" * 80)
+    elif opt_type == "adamw":
+        adam_lr = getattr(opt_cfg, "adam_learning_rate", getattr(cfg, "learning_rate", 3e-4))
+        b1 = getattr(opt_cfg, "b1", 0.90)
+        b2 = getattr(opt_cfg, "b2", 0.95)
+        wd = getattr(opt_cfg, "weight_decay", 0.01)
+        print(f"AdamW: lr={adam_lr}, betas=({b1}, {b2}), weight_decay={wd}")
+        print("-" * 80)
     print(f"{'Parameter':<48} {'Shape':<18} {'Optimizer':<12}")
     print("-" * 80)
 
@@ -425,7 +472,13 @@ def build_optimizer(
         The instantiated NNX optimizer and schedule function.
     """
     if schedule is None:
-        schedule = build_lr_schedule(cfg)
+        opt_cfg = getattr(cfg, "optimizer", ConfigDict())
+        opt_type = opt_cfg.get("type", OptimizerType.ADAMW.value)
+        if opt_type == OptimizerType.ADAMW.value and getattr(cfg, "learning_rate", None) == 0.02:
+            adam_lr = getattr(opt_cfg, "adam_learning_rate", 3e-4)
+            schedule = build_lr_schedule(cfg, learning_rate=adam_lr)
+        else:
+            schedule = build_lr_schedule(cfg)
 
     tx = build_optimizer_tx(cfg, schedule)
 

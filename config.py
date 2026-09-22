@@ -36,10 +36,17 @@ def get_config() -> ConfigDict:
     cfg.optimizer = ConfigDict()
     # cfg.optimizer.type = OptimizerType.ADAMW.value
     cfg.optimizer.type = OptimizerType.MUON.value
-    cfg.optimizer.b1 = 0.9
+    # Muon hyperparameters
+    cfg.optimizer.muon_learning_rate = 0.02
+    cfg.optimizer.momentum = 0.95  # beta in Muon
+    cfg.optimizer.muon_weight_decay = 0.0
+
+    # AdamW hyperparameters (for non-matrix parameters in Muon or standalone AdamW)
+    cfg.optimizer.adam_learning_rate = 3e-4
+    cfg.optimizer.b1 = 0.90
     cfg.optimizer.b2 = 0.95
     cfg.optimizer.eps = 1e-8
-    cfg.optimizer.weight_decay = 0.1
+    cfg.optimizer.weight_decay = 0.01
     cfg.optimizer.clip_by_global_norm = None
 
     # Mixed precision: use bfloat16 for faster computation, weights remain float32,
@@ -57,11 +64,7 @@ def get_config() -> ConfigDict:
     cfg.val_max_steps = 50  # max number of batches to use for validation
     cfg.max_steps = 12000  # total training steps
     cfg.warmup_steps = cfg.max_steps * 0.2
-    # cfg.learning_rate = 6e-4
-    # cfg.learning_rate = 1e-3
-    # cfg.learning_rate = 5e-3
-    cfg.learning_rate = 1.5e-3
-    # cfg.learning_rate = 1e-2
+    cfg.learning_rate = 0.02
     cfg.lr_end_ratio = 0.1  # end_value = learning_rate * lr_end_ratio
     cfg.lr_schedule = LRSchedule.TRAPEZOIDAL.value
     cfg.seed = 0

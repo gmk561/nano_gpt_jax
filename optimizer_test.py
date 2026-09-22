@@ -363,3 +363,36 @@ def test_full_train_step_with_muon():
         loss_1 = train_step(model, optimizer, x, y)
         assert not jnp.isnan(loss_1)
 
+
+def test_muon_adamw_learning_rates():
+    from config import get_config
+    cfg = get_config()
+    assert cfg.learning_rate == 0.02
+    assert cfg.optimizer.muon_learning_rate == 0.02
+    assert cfg.optimizer.momentum == 0.95
+    assert cfg.optimizer.adam_learning_rate == 3e-4
+    assert cfg.optimizer.b1 == 0.90
+    assert cfg.optimizer.b2 == 0.95
+    assert cfg.optimizer.weight_decay == 0.01
+
+    # Verify building optimizer and schedules
+    muon_sched = build_lr_schedule(cfg)
+    adam_sched = build_lr_schedule(cfg, learning_rate=cfg.optimizer.adam_learning_rate)
+
+    # Both schedules warm up and reach their respective peaks
+    mid_step = int(cfg.warmup_steps)
+    assert jnp.isclose(muon_sched(mid_step), 0.02)
+    assert jnp.isclose(adam_sched(mid_step), 3e-4)
+
+    # Build transformation and verify it initializes cleanly
+    tx = build_optimizer_tx(cfg, muon_sched)
+    params = {
+        "weight": jnp.ones((8, 8)),
+        "bias": jnp.zeros((8,)),
+    }
+    state = tx.init(params)
+    updates, _ = tx.update(params, state, params)
+    assert updates["weight"].shape == (8, 8)
+    assert updates["bias"].shape == (8,)
+
+

@@ -95,7 +95,7 @@ class MLP(nnx.Module):
             rngs=rngs,
             dtype=config.compute_dtype,
             kernel_init=init_fn,
-            kernel_metadata={"out_sharding": (None, None)},
+            kernel_metadata={"out_sharding": (None, None), "spectral_norm" : True},
             bias_init=nnx.initializers.zeros_init(),
             bias_metadata={"out_sharding": (None,)},
         )
@@ -105,7 +105,7 @@ class MLP(nnx.Module):
             rngs=rngs,
             dtype=config.compute_dtype,
             kernel_init=init_fn,
-            kernel_metadata={"out_sharding": (None, None)},
+            kernel_metadata={"out_sharding": (None, None), "spectral_norm" : True},
             bias_init=nnx.initializers.zeros_init(),
             bias_metadata={"out_sharding": (None,)},
         )

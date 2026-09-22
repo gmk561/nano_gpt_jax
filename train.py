@@ -59,7 +59,7 @@ from model import (
     train_step,
     val_step,
 )
-from optimizer import build_optimizer, print_optimizer_params
+from optimizer import build_lr_schedule, build_optimizer, print_optimizer_params
 
 
 _CONFIGS = {
@@ -181,6 +181,16 @@ if __name__ == "__main__":
         optimizer, schedule = build_optimizer(model, cfg)
         print_optimizer_params(model, cfg)
 
+        is_muon = getattr(getattr(cfg, "optimizer", None), "type", "").lower() == "muon"
+        adam_schedule = None
+        muon_schedule = None
+        if is_muon:
+            muon_schedule = schedule
+            adam_lr = getattr(cfg.optimizer, "adam_learning_rate", 3e-4)
+            adam_schedule = build_lr_schedule(cfg, learning_rate=adam_lr)
+        else:
+            adam_schedule = schedule
+
         ckpt_mngr = build_checkpoint_manager(cfg)
 
         # Resume from checkpoint if configured.
@@ -284,18 +294,29 @@ if __name__ == "__main__":
                 # micro_step already counts every micro-batch, and each
                 # processes batch_size * sequence_length tokens.
                 total_tokens = micro_step * cfg.sequence_length * cfg.batch_size
-                run.log(
-                    {
-                        "loss": loss.item(),
-                        "step_time_ms": dt * 1000,
-                        "tokens_per_sec": tokens_per_sec,
-                        "learning_rate": schedule(global_step).item(),
-                        "total_tokens_b": total_tokens / 1e9,
-                    },
-                    step=global_step,
-                )
+                log_dict = {
+                    "loss": loss.item(),
+                    "step_time_ms": dt * 1000,
+                    "tokens_per_sec": tokens_per_sec,
+                    "total_tokens_b": total_tokens / 1e9,
+                }
+                if is_muon:
+                    log_dict["learning_rate/muon"] = muon_schedule(global_step).item()
+                    log_dict["learning_rate/adam"] = adam_schedule(global_step).item()
+                    log_dict["muon_learning_rate"] = muon_schedule(global_step).item()
+                    log_dict["adam_learning_rate"] = adam_schedule(global_step).item()
+                    log_dict["learning_rate"] = muon_schedule(global_step).item()
+                    lr_str = f"muon_lr: {muon_schedule(global_step):.4f} | adam_lr: {adam_schedule(global_step):.6f}"
+                else:
+                    log_dict["learning_rate/adam"] = adam_schedule(global_step).item()
+                    log_dict["adam_learning_rate"] = adam_schedule(global_step).item()
+                    log_dict["learning_rate"] = adam_schedule(global_step).item()
+                    lr_str = f"lr: {adam_schedule(global_step):.6f}"
+
+                run.log(log_dict, step=global_step)
+
                 print(
-                    f"step {global_step:4d} | loss {loss:.4f} | lr: {schedule(global_step):.4f} | time {dt * 1000:.2f} ms | tokens/sec {tokens_per_sec:.2f} | tokens {total_tokens / 1e9:.3f}B"
+                    f"step {global_step:4d} | loss {loss:.4f} | {lr_str} | time {dt * 1000:.2f} ms | tokens/sec {tokens_per_sec:.2f} | tokens {total_tokens / 1e9:.3f}B"
                 )
                 t0 = time.time()
 
