@@ -7,8 +7,12 @@ Attention implementations live in :mod:`attention`.
 
 Classes
 -------
+RMSNorm
+    Root-mean-square layer normalisation (always in float32).
 MLP
-    Two-layer feed-forward block with GELU activation.
+    Two-layer feed-forward block with ReLU² activation.
+RoPE
+    Rotary position embedding module.
 Block
     Single transformer block: multi-head attention + MLP + RMSNorm.
 GPT
@@ -16,9 +20,6 @@ GPT
 
 Functions
 ---------
-is_cudnn_available()
-    Returns True if cuDNN is available for flash-attention dispatch.
-    See :mod:`attention`.
 cast_params()
     Cast all floating-point parameters in an NNX module to a target dtype.
 apply_dtype_policy()
@@ -46,24 +47,23 @@ from ml_collections import ConfigDict
 
 from attention import (
     build_attention_module,
-    is_cudnn_available,
     ATTENTION_TYPES,
-)  # noqa: F401
-from config import ActivationType
+)
+
+
+# ---------------------------------------------------------------------------
+# Activation
+# ---------------------------------------------------------------------------
 
 
 def relu_squared(x: jnp.ndarray) -> jnp.ndarray:
+    """ReLU² activation: ``relu(x)²``."""
     return jnp.square(nnx.relu(x.astype(jnp.float32))).astype(x.dtype)
 
 
-def get_activation_fn(activation: ActivationType | str):
-    activation = ActivationType(activation)
-    if activation == ActivationType.GELU:
-        return nnx.gelu
-    elif activation == ActivationType.RELU_SQUARED:
-        return relu_squared
-    else:
-        raise ValueError(f"Unknown activation type: {activation}")
+# ---------------------------------------------------------------------------
+# Layers
+# ---------------------------------------------------------------------------
 
 
 class RMSNorm(nnx.Module):
@@ -82,7 +82,7 @@ class RMSNorm(nnx.Module):
         normed = x_fp32 * inv_rms
         output = normed * self.weight.value
 
-        return output.astype(x.dtype)
+        return output.astype(x_dtype)
 
 
 class MLP(nnx.Module):
@@ -95,7 +95,7 @@ class MLP(nnx.Module):
             rngs=rngs,
             dtype=config.compute_dtype,
             kernel_init=init_fn,
-            kernel_metadata={"out_sharding": (None, None), "spectral_norm" : True},
+            kernel_metadata={"out_sharding": (None, None), "spectral_norm": True},
             bias_init=nnx.initializers.zeros_init(),
             bias_metadata={"out_sharding": (None,)},
         )
@@ -105,15 +105,13 @@ class MLP(nnx.Module):
             rngs=rngs,
             dtype=config.compute_dtype,
             kernel_init=init_fn,
-            kernel_metadata={"out_sharding": (None, None), "spectral_norm" : True},
+            kernel_metadata={"out_sharding": (None, None), "spectral_norm": True},
             bias_init=nnx.initializers.zeros_init(),
             bias_metadata={"out_sharding": (None,)},
         )
 
-        self.activation = get_activation_fn(config.activation)
-
     def __call__(self, x: jnp.ndarray):
-        return self.linear_2(self.activation(self.linear_1(x)))
+        return self.linear_2(relu_squared(self.linear_1(x)))
 
 
 class RoPE(nnx.Module):
@@ -159,8 +157,7 @@ class RoPE(nnx.Module):
 class Block(nnx.Module):
     def __init__(self, config: ConfigDict, rngs: nnx.Rngs):
         self.config = config
-        # Attention module is selected by config.attention_type.
-        # See attention.py / AttentionType for available options.
+        # Attention module is selected by config.attention_type ("flash" or "flax").
         self.mha = build_attention_module(
             config, rope=RoPE(config, rngs) if config.use_rope else None, rngs=rngs
         )
@@ -280,6 +277,11 @@ class GPT(nnx.Module):
         return logits.astype(self.config.accum_dtype)
 
 
+# ---------------------------------------------------------------------------
+# Dtype utilities
+# ---------------------------------------------------------------------------
+
+
 def cast_params(module: nnx.Module, dtype):
     """Cast all float params in a module subtree to dtype."""
 
@@ -310,6 +312,11 @@ def dtype_report(model: nnx.Module):
                 dtype = param[...].dtype
                 if dtype == jnp.float32:
                     print(f"{path} {attr} {dtype}")
+
+
+# ---------------------------------------------------------------------------
+# Loss and training steps
+# ---------------------------------------------------------------------------
 
 
 def loss_fn(model: GPT, x: jnp.ndarray, y: jnp.ndarray):

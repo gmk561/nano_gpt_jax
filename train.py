@@ -3,12 +3,13 @@ Training entry point for nano-GPT JAX.
 
 Run with::
 
-    python train.py [--config gpu|cpu|mem_eff] [--set KEY=VALUE ...]
+    python train.py [--preset gpu|cpu] [--set KEY=VALUE ...]
 
 Examples::
 
-    python train.py --config mem_eff --set model.query_chunk_size=32
-    python train.py --config gpu --set model.attention_type=classical
+    python train.py                                 # auto-detect GPU/CPU
+    python train.py --preset cpu --set max_steps=50
+    python train.py --set optimizer.type=muon
     python train.py --set resume_ckpt=latest
 """
 
@@ -38,7 +39,6 @@ if os.path.exists(".env"):
 import time
 
 import jax
-import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -49,7 +49,7 @@ from checkpoint import (
     restore_from_checkpoint,
     save_checkpoint,
 )
-from config import get_config, get_cpu_test_config, get_mem_eff_config
+from config import OPTIMIZER_MUON, get_config
 from data import GPT2_VOCAB_SIZE, create_train_loader, create_val_loader
 from model import (
     GPT,
@@ -62,20 +62,13 @@ from model import (
 from optimizer import build_lr_schedule, build_optimizer, print_optimizer_params
 
 
-_CONFIGS = {
-    "gpu": get_config,
-    "cpu": get_cpu_test_config,
-    "mem_eff": get_mem_eff_config,
-}
-
-
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="nano-GPT JAX training")
     parser.add_argument(
-        "--config",
-        choices=list(_CONFIGS),
-        default=None,
-        help="Config preset. Defaults to 'gpu' if an accelerator is detected, else 'cpu'.",
+        "--preset",
+        choices=["gpu", "cpu", "auto"],
+        default="auto",
+        help="Config preset. Defaults to 'auto' (GPU if accelerator detected, else CPU).",
     )
     parser.add_argument(
         "--set",
@@ -137,29 +130,24 @@ else:
     import wandb  # type: ignore[no-redef]
 
 
-_accelerator_backends = {"gpu", "tpu"}
-
-
 if __name__ == "__main__":
     args = _parse_args()
 
-    # ── Training setup ──────────────────────────────────────────────────────────
+    # ── Training setup ──────────────────────────────────────────────────────
     print("jax.device_count():", jax.device_count())
     nnx.use_eager_sharding(True)
 
-    _has_accelerator = any(d.platform in _accelerator_backends for d in jax.devices())
-    print(f"Training with accelerator: {_has_accelerator}")
-    print("Is cudnn available? ", is_cudnn_available())
-
-    preset = args.config or ("gpu" if _has_accelerator else "cpu")
-    cfg = _CONFIGS[preset]()
+    cfg = get_config(preset=args.preset)
     _apply_overrides(cfg, args.set)
-    print(f"Using config preset: {preset}")
-    # 2D mesh: ('data', 'model'). For now model=1; later change to (dp, mp) for tensor parallelism.
+
+    is_gpu = cfg.model.attention_type == "flash"
+    print(f"Using preset: {'gpu' if is_gpu else 'cpu'}")
+    print("Is cudnn available?", is_cudnn_available())
+
+    # 2D mesh: ('data', 'model'). For now model=1; later for tensor parallelism.
     mesh = jax.make_mesh((cfg.num_devices, 1), ("data", "model"))
 
-    # Build Grain data loaders (support multi-host data parallelism via
-    # ShardByJaxProcess; on a single process this is equivalent to NoSharding).
+    # Build Grain data loaders.
     train_loader = create_train_loader(cfg)
     val_loader = create_val_loader(cfg)  # None for input_txt dataset
 
@@ -181,13 +169,10 @@ if __name__ == "__main__":
         optimizer, schedule = build_optimizer(model, cfg)
         print_optimizer_params(model, cfg)
 
-        is_muon = getattr(getattr(cfg, "optimizer", None), "type", "").lower() == "muon"
-        adam_schedule = None
-        muon_schedule = None
+        is_muon = cfg.optimizer.type == OPTIMIZER_MUON
         if is_muon:
             muon_schedule = schedule
-            adam_lr = getattr(cfg.optimizer, "adam_learning_rate", 3e-4)
-            adam_schedule = build_lr_schedule(cfg, learning_rate=adam_lr)
+            adam_schedule = build_lr_schedule(cfg, learning_rate=cfg.optimizer.adam_learning_rate)
         else:
             adam_schedule = schedule
 
@@ -197,9 +182,9 @@ if __name__ == "__main__":
         start_step = restore_from_checkpoint(
             cfg, ckpt_mngr, model, optimizer, train_iter
         )
-        print("Start step: ", start_step)
+        print("Start step:", start_step)
 
-        last_val_loss = float("inf")  # track for checkpointing metrics
+        last_val_loss = float("inf")
 
         run = wandb.init(
             project="nano-gpt-jax",
@@ -207,6 +192,7 @@ if __name__ == "__main__":
             config=cfg.to_dict(),
         )
 
+        t0 = time.time()
         for micro_step, batch in enumerate(
             train_iter, start=start_step * cfg.grad_acc_steps
         ):
@@ -291,8 +277,6 @@ if __name__ == "__main__":
                 tokens_per_sec = (
                     cfg.sequence_length * cfg.batch_size * cfg.grad_acc_steps / dt
                 )
-                # micro_step already counts every micro-batch, and each
-                # processes batch_size * sequence_length tokens.
                 total_tokens = micro_step * cfg.sequence_length * cfg.batch_size
                 log_dict = {
                     "loss": loss.item(),
@@ -303,13 +287,8 @@ if __name__ == "__main__":
                 if is_muon:
                     log_dict["learning_rate/muon"] = muon_schedule(global_step).item()
                     log_dict["learning_rate/adam"] = adam_schedule(global_step).item()
-                    log_dict["muon_learning_rate"] = muon_schedule(global_step).item()
-                    log_dict["adam_learning_rate"] = adam_schedule(global_step).item()
-                    log_dict["learning_rate"] = muon_schedule(global_step).item()
                     lr_str = f"muon_lr: {muon_schedule(global_step):.4f} | adam_lr: {adam_schedule(global_step):.6f}"
                 else:
-                    log_dict["learning_rate/adam"] = adam_schedule(global_step).item()
-                    log_dict["adam_learning_rate"] = adam_schedule(global_step).item()
                     log_dict["learning_rate"] = adam_schedule(global_step).item()
                     lr_str = f"lr: {adam_schedule(global_step):.6f}"
 

@@ -1,27 +1,20 @@
 """
 Attention mechanisms for nano-GPT JAX.
 
-Provides multiple multi-head attention implementations selectable via
-:class:`AttentionType` and the :func:`build_attention_module` factory.
+Provides two multi-head attention backends selectable via
+``cfg.model.attention_type`` in ``config.py``:
 
-AttentionType
--------------
-FLAX
-    The out-of-the-box ``nnx.MultiHeadAttention`` with its default built-in
-    attention kernel.  Use this as a numerically stable reference baseline
-    when developing and debugging custom attention variants.
-FLASH
+``"flash"``
     ``nnx.MultiHeadAttention`` with ``jax.nn.dot_product_attention`` as the
     inner kernel.  Dispatches to cuDNN flash attention on supported GPUs and
-    falls back to the XLA implementation otherwise.  This is the current
-    production default.
-CLASSICAL
-    Explicit scaled dot-product attention written from scratch following
-    Vaswani et al. (2017) "Attention is All You Need".  Useful as a learning
-    exercise and for building new attention variants on top of a clean,
-    readable reference.
+    falls back to the XLA implementation otherwise.  This is the production
+    default for GPU training.
 
-Configure via ``cfg.model.attention_type`` in ``config.py``.
+``"flax"``
+    ``nnx.MultiHeadAttention`` with its default built-in attention kernel.
+    Numerically stable reference baseline, used for CPU testing.
+
+Configure via ``cfg.model.attention_type`` (``"flash"`` or ``"flax"``).
 """
 
 from __future__ import annotations
@@ -29,23 +22,10 @@ from __future__ import annotations
 from flax.nnx.nn.attention import dot_product_attention as flax_dot_product_attention
 
 import functools
-import math
-from enum import Enum
 
 import jax
-import jax.numpy as jnp
 from flax import nnx
 from ml_collections import ConfigDict
-
-
-Array = jax.Array
-
-
-class AttentionType(str, Enum):
-    FLAX = "flax"
-    FLASH = "flash"
-    CLASSICAL = "classical"
-    MEM_EFF = "mem_eff"
 
 
 def is_cudnn_available() -> bool:
@@ -85,257 +65,34 @@ def _flash_attention_kernel(
     )
 
 
-# Implementation of the classical
-# Attention is all you need paper: https://arxiv.org/abs/1706.03762
-class MultiHeadAttention(nnx.Module):
-    def __init__(
-        self,
-        n_embd: int,
-        num_heads: int,
-        use_bias: bool,
-        rope: nnx.Module | None = None,
-        kernel_init: nnx.initializers.Initializer = nnx.initializers.lecun_normal(),
-        bias_init: nnx.initializers.Initializer = nnx.initializers.zeros_init(),
-        *,
-        rngs: nnx.Rngs,
-    ) -> None:
-        if n_embd % num_heads != 0:
-            raise ValueError(
-                f"Incompatible dimensions: `n_embd` ({n_embd}) must be divisible "
-                f"by `num_heads` ({num_heads}) for the Flax linear layer weights to reshape correctly."
-            )
-
-        self.n_embd = n_embd
-        self.use_bias = use_bias
-        self.num_heads = num_heads
-        head_dim = n_embd // num_heads
-        self.head_dim = head_dim
-
-        self.scale = math.sqrt(self.head_dim)
-
-        linear = functools.partial(
-            nnx.LinearGeneral,
-            in_features=n_embd,
-            out_features=(num_heads, head_dim),
-            use_bias=use_bias,
-            kernel_init=kernel_init,
-            bias_init=bias_init,
-        )
-
-        self.query = linear(rngs=rngs)
-        self.key = linear(rngs=rngs)
-        self.value = linear(rngs=rngs)
-
-        self.out = nnx.LinearGeneral(
-            in_features=(num_heads, head_dim),
-            out_features=n_embd,
-            use_bias=use_bias,
-            kernel_init=kernel_init,
-            bias_init=bias_init,
-            rngs=rngs,
-            axis=(-2, -1),
-        )
-        self.rope = rope
-
-    def softmax(self, qk):
-        max_element = jnp.max(qk, axis=-1, keepdims=True)
-        qkm = qk - max_element
-        unnormalized = jnp.exp(qkm / self.scale)
-
-        sm = unnormalized / jnp.sum(unnormalized, axis=-1, keepdims=True)
-        return sm
-
-    def __call__(self, x, mask=None):
-        B, T, D = x.shape
-
-        q, k, v = (self.query(x), self.key(x), self.value(x))  # (B, T, D)
-
-        q = q if self.rope is None else self.rope(q)
-        k = k if self.rope is None else self.rope(k)
-
-        qk = jnp.einsum("...qhd,...khd->...hqk", q, k)
-        if mask is not None:
-            qk = jnp.where(mask, qk, -jnp.inf)
-        sm = self.softmax(qk)  # (B, H, T, T)
-        att = jnp.einsum("...hqk,...khd->...qhd", sm, v)  # (B, T, H, D)
-
-        out = self.out(att)  # (B, T, D)
-
-        return out
-
-
-class MemoryEfficientAttention(nnx.Module):
-    # Implementation of https://arxiv.org/pdf/2112.05682.
-
-    def __init__(
-        self,
-        n_embd,
-        num_heads,
-        use_bias,
-        query_chunk_size: int = 64,
-        key_chunk_size: int = 64,
-        kernel_init: nnx.initializers.Initializer = nnx.initializers.lecun_normal(),
-        bias_init: nnx.initializers.Initializer = nnx.initializers.zeros_init(),
-        *,
-        rope: nnx.Module | None = None,
-        rngs: nnx.Rngs,
-    ) -> None:
-        if n_embd % num_heads != 0:
-            raise ValueError(
-                f"Incompatible dimensions: `n_embd` ({n_embd}) must be divisible "
-                f"by `num_heads` ({num_heads}) for the Flax linear layer weights to reshape correctly."
-            )
-
-        self.n_embd = n_embd
-        self.use_bias = use_bias
-        self.num_heads = num_heads
-        head_dim = n_embd // num_heads
-        self.head_dim = head_dim
-        self.query_chunk_size = query_chunk_size
-        self.key_chunk_size = key_chunk_size
-
-        self.scale = math.sqrt(self.head_dim)
-
-        linear = functools.partial(
-            nnx.LinearGeneral,
-            in_features=n_embd,
-            out_features=(num_heads, head_dim),
-            use_bias=use_bias,
-            kernel_init=kernel_init,
-            bias_init=bias_init,
-        )
-
-        self.rope = rope
-        self.query = linear(rngs=rngs)
-        self.key = linear(rngs=rngs)
-        self.value = linear(rngs=rngs)
-
-        self.out = nnx.LinearGeneral(
-            in_features=(num_heads, head_dim),
-            out_features=n_embd,
-            use_bias=use_bias,
-            kernel_init=kernel_init,
-            bias_init=bias_init,
-            rngs=rngs,
-            axis=(-2, -1),
-        )
-
-    def _chunk_attention(self, query, keys, values, B, H, D, T, mask=None):
-        """Scan over all key/value chunks for one query chunk and return the
-        normalised attention output.
-
-        Parameters
-        ----------
-        query_chunk : (B, chunk_size, H, D)
-        k, v        : (B, T, H, D)
-        B, H, D, T  : int — static dimension sizes
-        """
-
-        @functools.partial(jax.checkpoint, prevent_cse=False)
-        def chunk_scanner(idx):
-            sliced_keys = jax.lax.dynamic_slice(
-                keys,
-                start_indices=(0, idx * self.key_chunk_size, 0, 0),
-                slice_sizes=(B, self.key_chunk_size, H, D),
-            )  # (B, C, H, D)
-            sliced_values = jax.lax.dynamic_slice(
-                values,
-                start_indices=(0, idx * self.key_chunk_size, 0, 0),
-                slice_sizes=(B, self.key_chunk_size, H, D),
-            )  # (B, C, H, D)
-
-            attention_weights = jnp.einsum(
-                "bchd,bkhd->bhck",
-                query,
-                sliced_keys,
-            )  # (B, H, C, C)
-            attention_weights = attention_weights / self.scale  # (B, H, C, C)
-
-            if mask is not None:
-                sliced_mask = jax.lax.dynamic_slice(
-                    mask,
-                    start_indices=(0, 0, 0, idx * self.key_chunk_size),
-                    slice_sizes=(1, 1, self.query_chunk_size, self.key_chunk_size),
-                )
-                attention_weights = jnp.where(sliced_mask, attention_weights, -jnp.inf)
-
-            max_att_weight = jnp.max(
-                attention_weights, axis=-1, keepdims=True
-            )  # (B, H, C, 1)
-
-            max_att_weight = jnp.maximum(max_att_weight, -1e9)
-            attention_weights = attention_weights - max_att_weight
-            # Clamp it so it can never drop below a safe finite value
-            # As -inf - -inf = NaN
-
-            exp_att_weights = jnp.exp(attention_weights)  # (B, H, C, C)
-            exp_att_values = jnp.einsum(
-                "bhqk,bkhd->bhqd", exp_att_weights, sliced_values
-            )  # (B, C, H, D)
-
-            return max_att_weight, jnp.sum(exp_att_weights, axis=-1), exp_att_values
-
-        max_att_weights, exp_attention_weights, exp_att_values = jax.lax.map(
-            chunk_scanner, jnp.arange(math.ceil(T / self.key_chunk_size))
-        )
-
-        global_max_att_weight = jnp.max(max_att_weights, axis=0)
-        exp_max_att_diff = jnp.exp(
-            max_att_weights - global_max_att_weight
-        )  # (N_K, B, H, C, 1)
-
-        exp_att_values = jnp.sum(
-            exp_att_values * exp_max_att_diff, axis=0, keepdims=False
-        )  # (B,T,H,D)
-
-        exp_attention_weights = jnp.sum(
-            exp_attention_weights * exp_max_att_diff[..., 0], axis=0, keepdims=False
-        )  # (B,T,H,D)
-
-        return exp_att_values / exp_attention_weights[..., None]
-
-    def __call__(self, x, mask=None):
-        q, k, v = self.query(x), self.key(x), self.value(x)
-        if self.rope is not None:
-            q = self.rope(q, position_axis=1)
-            k = self.rope(k, position_axis=1)
-
-        B, T, H, D = q.shape
-
-        def _query_chunk_processor(idx: int, _):
-            query_chunk = jax.lax.dynamic_slice(
-                q,
-                start_indices=(0, idx * self.query_chunk_size, 0, 0),
-                slice_sizes=(B, self.query_chunk_size, H, D),
-            )
-
-            mask_chunk = None
-            if mask is not None:
-                mask_chunk = jax.lax.dynamic_slice(
-                    mask,
-                    start_indices=(0, 0, idx * self.query_chunk_size, 0),
-                    slice_sizes=(1, 1, self.query_chunk_size, T),
-                )
-
-            return idx + 1, self._chunk_attention(
-                query_chunk, k, v, B, H, D, T, mask=mask_chunk
-            )
-
-        num_chunks = int(math.ceil(T / self.query_chunk_size))
-        _, att = jax.lax.scan(
-            _query_chunk_processor, init=0, xs=None, length=num_chunks
-        )  # (num_chunks, B, C, H, D)
-
-        return self.out(att.transpose(1, 0, 3, 2, 4).reshape(B, T, H, D))
-
-
 def build_attention_module(
     config: ConfigDict,
     *,
     rope: nnx.Module | None = None,
     rngs: nnx.Rngs,
 ) -> nnx.Module:
-    attn_type = AttentionType(config.attention_type)
+    """Build a multi-head attention module from config.
+
+    Parameters
+    ----------
+    config:
+        Model config containing ``attention_type``, ``n_head``, ``n_embd``,
+        and ``compute_dtype``.
+    rope:
+        Optional RoPE module for rotary position embeddings.
+    rngs:
+        Flax NNX random number generators.
+
+    Returns
+    -------
+    An ``nnx.MultiHeadAttention`` instance.
+
+    Raises
+    ------
+    ValueError
+        If ``config.attention_type`` is not ``"flash"`` or ``"flax"``.
+    """
+    attn_type = config.attention_type
     init_fn = nnx.initializers.normal(stddev=0.02)
     zeros = nnx.initializers.zeros_init()
 
@@ -357,7 +114,7 @@ def build_attention_module(
         normalize_qk=True,
     )
 
-    if attn_type == AttentionType.FLAX:
+    if attn_type == "flax":
         if rope is not None:
 
             def rope_flax_attention_fn(
@@ -372,8 +129,7 @@ def build_attention_module(
             mha_kwargs["attention_fn"] = rope_flax_attention_fn
         return nnx.MultiHeadAttention(**mha_kwargs)
 
-    if attn_type == AttentionType.FLASH:
-        # Custom inner kernel: cuDNN flash on GPU, XLA otherwise.
+    if attn_type == "flash":
         return nnx.MultiHeadAttention(
             **mha_kwargs,
             attention_fn=functools.partial(
@@ -381,41 +137,11 @@ def build_attention_module(
             ),
         )
 
-    if attn_type == AttentionType.CLASSICAL:
-        return MultiHeadAttention(
-            n_embd=config.n_embd,
-            num_heads=config.n_head,
-            use_bias=config.use_attention_bias,
-            rope=rope,
-            kernel_init=init_fn,
-            bias_init=zeros,
-            rngs=rngs,
-        )
-
-    if attn_type == AttentionType.MEM_EFF:
-        query_chunk_size = getattr(config, "query_chunk_size", 64)
-        key_chunk_size = getattr(config, "key_chunk_size", 64)
-        return MemoryEfficientAttention(
-            n_embd=config.n_embd,
-            num_heads=config.n_head,
-            use_bias=config.use_attention_bias,
-            query_chunk_size=query_chunk_size,
-            key_chunk_size=key_chunk_size,
-            rope=rope,
-            kernel_init=init_fn,
-            bias_init=zeros,
-            rngs=rngs,
-        )
-
     raise ValueError(
-        f"Unknown attention_type {config.attention_type!r}. "
-        f"Valid choices: {[e.value for e in AttentionType]}"
+        f"Unknown attention_type {attn_type!r}. Valid choices: 'flash', 'flax'."
     )
 
 
-# All concrete attention module classes — used for isinstance checks elsewhere.
-ATTENTION_TYPES = (
-    nnx.MultiHeadAttention,
-    MultiHeadAttention,
-    MemoryEfficientAttention,
-)
+# All concrete attention module classes — used for isinstance checks elsewhere
+# (e.g. weight initialisation in model.py).
+ATTENTION_TYPES = (nnx.MultiHeadAttention,)

@@ -430,6 +430,8 @@ def create_val_loader(cfg: "ConfigDict") -> grain.DataLoader | None:
     -------
     A :class:`~grain.python.DataLoader` or ``None``.
     """
+    if cfg.dataset == "input_txt":
+        return None
     source = EduFinewebShardSource(sequence_length=cfg.sequence_length, split="val")
     local_bs = _local_batch_size(cfg)
 
