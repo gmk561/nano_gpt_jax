@@ -79,7 +79,6 @@ def get_config(preset: str = "auto") -> ConfigDict:
     cfg.optimizer.type = OPTIMIZER_MUON if is_gpu else OPTIMIZER_ADAMW
 
     # Muon hyperparameters
-    cfg.optimizer.muon_learning_rate = 0.02
     cfg.optimizer.momentum = 0.95
     cfg.optimizer.muon_weight_decay = 0.0
 
@@ -92,6 +91,7 @@ def get_config(preset: str = "auto") -> ConfigDict:
     cfg.optimizer.clip_by_global_norm = None
 
     # ── Mixed precision ────────────────────────────────────────────────────
+    cfg.is_gpu = is_gpu
     # bfloat16 activations/params on GPU; full float32 on CPU.
     cfg.apply_dtype_policy = is_gpu
 
@@ -146,6 +146,5 @@ def get_config(preset: str = "auto") -> ConfigDict:
 
     # Attention: "flash" on GPU (cuDNN/XLA), "flax" on CPU (reference).
     cfg.model.attention_type = "flash" if is_gpu else "flax"
-    cfg.model.use_rope = True
 
     return cfg

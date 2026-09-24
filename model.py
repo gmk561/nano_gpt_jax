@@ -39,16 +39,52 @@ align_acc_step()
 from __future__ import annotations
 
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import optax
 from flax import nnx
 from ml_collections import ConfigDict
 
-from attention import (
-    build_attention_module,
-    ATTENTION_TYPES,
-)
+
+def is_cudnn_available() -> bool:
+    """Return ``True`` if a cuDNN runtime is accessible via JAX."""
+    try:
+        from jax._src.lib import cuda_versions
+
+        return (
+            cuda_versions is not None and cuda_versions.cudnn_get_version() is not None
+        )
+    except (ImportError, AttributeError, RuntimeError):
+        return False
+
+
+def _causal_dot_product_attention(
+    query: jnp.ndarray,
+    key: jnp.ndarray,
+    value: jnp.ndarray,
+    rope: RoPE | None = None,
+    bias: jnp.ndarray | None = None,
+    mask: jnp.ndarray | None = None,
+    **kwargs,
+) -> jnp.ndarray:
+    """Causal dot-product attention with RoPE, dispatching to cuDNN when available."""
+    if rope is not None:
+        query = rope(query, position_axis=2)
+        key = rope(key, position_axis=2)
+    impl = "cudnn" if is_cudnn_available() else "xla"
+    return jax.nn.dot_product_attention(
+        query,
+        key,
+        value,
+        bias=bias,
+        is_causal=True,
+        implementation=impl,
+    )
+
+
+ATTENTION_TYPES = (nnx.MultiHeadAttention,)
 
 
 # ---------------------------------------------------------------------------
@@ -157,9 +193,28 @@ class RoPE(nnx.Module):
 class Block(nnx.Module):
     def __init__(self, config: ConfigDict, rngs: nnx.Rngs):
         self.config = config
-        # Attention module is selected by config.attention_type ("flash" or "flax").
-        self.mha = build_attention_module(
-            config, rope=RoPE(config, rngs) if config.use_rope else None, rngs=rngs
+        init_fn = nnx.initializers.normal(stddev=0.02)
+        zeros = nnx.initializers.zeros_init()
+        self.rope = RoPE(config, rngs)
+        self.mha = nnx.MultiHeadAttention(
+            num_heads=config.n_head,
+            in_features=config.n_embd,
+            qkv_features=config.n_embd,
+            rngs=rngs,
+            decode=False,
+            dtype=config.compute_dtype,
+            kernel_init=init_fn,
+            kernel_metadata={"out_sharding": (None, None, None)},
+            out_kernel_init=init_fn,
+            out_kernel_metadata={"out_sharding": (None, None, None)},
+            bias_init=zeros,
+            bias_metadata={"out_sharding": (None,)},
+            out_bias_init=zeros,
+            out_bias_metadata={"out_sharding": (None,)},
+            normalize_qk=True,
+            attention_fn=functools.partial(
+                _causal_dot_product_attention, rope=self.rope
+            ),
         )
         self.mlp = MLP(config, rngs=rngs)
         self.layernorm_1 = RMSNorm(config.n_embd)
@@ -267,8 +322,6 @@ class GPT(nnx.Module):
         mask = self._causal_mask[:, :, :T, :T]
 
         x = self.wte(x, out_sharding=jax.typeof(x).sharding)
-        if not self.config.use_rope:
-            x = x + self.wpe(jnp.arange(T))
 
         for block in self.blocks:
             x = block(x, mask)

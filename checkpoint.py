@@ -123,11 +123,15 @@ def save_checkpoint(
         Optional W&B run object; if provided, the checkpoint is uploaded as an artifact.
     """
     ckpt_state = get_checkpoint_state(model, optimizer, step)
-    ckpt_mngr.save(
+    saved = ckpt_mngr.save(
         step,
         args=ocp.args.StandardSave(ckpt_state),
         metrics={"val_loss": val_loss},
     )
+    if not saved:
+        print(f"  → checkpoint at step {step} skipped by manager")
+        return
+
     print(f"  → checkpoint saved at step {step}")
 
     # Wait for the async Orbax write so the step directory exists before we
@@ -135,7 +139,9 @@ def save_checkpoint(
     ckpt_mngr.wait_until_finished()
 
     # Persist Grain iterator state alongside the checkpoint.
-    grain_state_path = os.path.join(cfg.ckpt_dir, str(step), "grain_train_state.bin")
+    step_dir = os.path.join(cfg.ckpt_dir, str(step))
+    os.makedirs(step_dir, exist_ok=True)
+    grain_state_path = os.path.join(step_dir, "grain_train_state.bin")
     with open(grain_state_path, "wb") as fh:
         fh.write(get_iter_state(train_iter))
 

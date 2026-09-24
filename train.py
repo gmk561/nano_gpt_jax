@@ -39,11 +39,11 @@ if os.path.exists(".env"):
 import time
 
 import jax
+import wandb
 from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from attention import is_cudnn_available
 from checkpoint import (
     build_checkpoint_manager,
     restore_from_checkpoint,
@@ -56,6 +56,7 @@ from model import (
     align_acc_step,
     apply_dtype_policy,
     dtype_report,
+    is_cudnn_available,
     train_step,
     val_step,
 )
@@ -100,36 +101,6 @@ def _apply_overrides(cfg, overrides: list[str]) -> None:
         setattr(obj, parts[-1], value)
 
 
-class MockWandb:
-    @staticmethod
-    def init(*args, **kwargs):
-        class Run:
-            def log(self, *args, **kwargs):
-                pass
-
-            def finish(self, *args, **kwargs):
-                pass
-
-            def log_artifact(self, *args, **kwargs):
-                pass
-
-        return Run()
-
-    @staticmethod
-    def log(*args, **kwargs):
-        pass
-
-    @staticmethod
-    def finish(*args, **kwargs):
-        pass
-
-
-if os.environ.get("WANDB_MODE") == "disabled":
-    wandb = MockWandb()
-else:
-    import wandb  # type: ignore[no-redef]
-
-
 if __name__ == "__main__":
     args = _parse_args()
 
@@ -140,7 +111,7 @@ if __name__ == "__main__":
     cfg = get_config(preset=args.preset)
     _apply_overrides(cfg, args.set)
 
-    is_gpu = cfg.model.attention_type == "flash"
+    is_gpu = cfg.is_gpu
     print(f"Using preset: {'gpu' if is_gpu else 'cpu'}")
     print("Is cudnn available?", is_cudnn_available())
 
@@ -248,7 +219,7 @@ if __name__ == "__main__":
                     )
 
                 if global_step > 0 and global_step % cfg.ckpt_every_steps == 0:
-                    wandb_run = run if not isinstance(wandb, MockWandb) else None
+                    wandb_run = run if not getattr(run, "disabled", False) else None
                     save_checkpoint(
                         ckpt_mngr,
                         model,

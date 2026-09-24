@@ -2,7 +2,7 @@
 Data loading for nano-GPT JAX training.
 
 Provides Grain-based data source implementations and factory functions for
-training, validation, and HellaSwag evaluation data loaders.
+training and validation data loaders.
 
 All loaders use :class:`grain.ShardByJaxProcess` so that multi-host JAX
 training automatically assigns non-overlapping data subsets to each host
@@ -41,10 +41,8 @@ from typing import Any
 
 import jax
 import numpy as np
-import requests
 import tiktoken
 from ml_collections import ConfigDict
-from tqdm import tqdm
 
 import grain.python as grain
 
@@ -57,45 +55,9 @@ if not _absl_flags.FLAGS.is_parsed():
     _absl_flags.FLAGS.mark_as_parsed()
 
 
-# GPT2_VOCAB_SIZE: int = tiktoken.get_encoding("gpt2").n_vocab
 GPT2_VOCAB_SIZE: int = 50304
 
 _EDU_FINEWEB_DATA_DIR: str = os.path.join(os.path.dirname(__file__), "edu_fineweb10B")
-_HELLASWAG_DATA_DIR: str = os.path.join(os.path.dirname(__file__), "hellaswag")
-_HELLASWAG_URLS: dict[str, str] = {
-    "train": "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_train.jsonl",
-    "val": "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_val.jsonl",
-    "test": "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_test.jsonl",
-}
-
-# ── Tokenizers ─────────────────────────────────────────────────────────────────
-
-
-class CharTokenizer:
-    """Simple character-level tokenizer.
-
-    Builds a vocabulary from the unique characters in *text* and provides
-    :meth:`encode` / :meth:`decode` round-trips.  Useful for small toy datasets
-    (e.g. ``input.txt``); the main training pipeline uses the GPT-2 tiktoken
-    encoder instead.
-
-    Parameters
-    ----------
-    text:
-        Full corpus string used to derive the vocabulary.
-    """
-
-    def __init__(self, text: str):
-        chars = sorted(set(text))
-        self.vocab_size = len(chars)
-        self.stoi = {ch: i for i, ch in enumerate(chars)}  # char -> int
-        self.itos = {i: ch for i, ch in enumerate(chars)}  # int -> char
-
-    def encode(self, text: str) -> list[int]:
-        return [self.stoi[ch] for ch in text]
-
-    def decode(self, tokens: list[int]) -> str:
-        return "".join(self.itos[i] for i in tokens)
 
 
 
@@ -238,91 +200,6 @@ class InputTxtSource:
         return {"x": buf[:-1].copy(), "y": buf[1:].copy()}
 
 
-# ── HellaSwag data source ──────────────────────────────────────────────────────
-
-
-def _download_hellaswag(split: str) -> None:
-    """Download a HellaSwag split into the local cache directory if needed."""
-    dest = os.path.join(_HELLASWAG_DATA_DIR, f"hellaswag_{split}.jsonl")
-    if os.path.exists(dest):
-        return
-    os.makedirs(_HELLASWAG_DATA_DIR, exist_ok=True)
-    url = _HELLASWAG_URLS[split]
-    print(f"Downloading {url} → {dest} ...")
-    resp = requests.get(url, stream=True)
-    total = int(resp.headers.get("content-length", 0))
-    with open(dest, "wb") as fh, tqdm(
-        total=total, unit="iB", unit_scale=True, unit_divisor=1024
-    ) as bar:
-        for chunk in resp.iter_content(chunk_size=1024):
-            fh.write(chunk)
-            bar.update(len(chunk))
-
-
-class HellaSwagSource:
-    """Grain-compatible data source for HellaSwag evaluation examples.
-
-    Loads the JSONL file eagerly into memory (≈ 10 MB for the val split).
-    Downloads the file automatically if it is not already cached.
-
-    Each item ``__getitem__(idx)`` returns a dict::
-
-        {
-          "tokens": int32[4, max_len],   # context + each ending, right-padded
-          "mask":   int32[4, max_len],   # 1 over ending tokens, 0 elsewhere
-          "label":  int32,               # index of the correct ending (0–3)
-        }
-
-    ``max_len`` varies per example.  Use ``batch_size=1`` with
-    :func:`create_hellaswag_loader`, or add a padding transform to collate
-    examples to a fixed block size.
-
-    Parameters
-    ----------
-    split:
-        ``"train"``, ``"val"``, or ``"test"``.
-    """
-
-    def __init__(self, split: str = "val") -> None:
-        import json
-
-        self._split = split
-        _download_hellaswag(split)
-        path = os.path.join(_HELLASWAG_DATA_DIR, f"hellaswag_{split}.jsonl")
-        with open(path, "r") as fh:
-            self._examples = [json.loads(line) for line in fh]
-        self._enc = tiktoken.get_encoding("gpt2")
-
-    def __repr__(self) -> str:
-        return f"HellaSwagSource(split={self._split!r})"
-
-    def __len__(self) -> int:
-        return len(self._examples)
-
-    def __getitem__(self, idx: int) -> dict[str, Any]:
-        example = self._examples[idx]
-        ctx_tokens = self._enc.encode(example["ctx"])
-        label = int(example["label"])
-
-        tok_rows: list[list[int]] = []
-        mask_rows: list[list[int]] = []
-        for ending in example["endings"]:
-            end_toks = self._enc.encode(" " + ending)
-            tok_rows.append(ctx_tokens + end_toks)
-            mask_rows.append([0] * len(ctx_tokens) + [1] * len(end_toks))
-
-        max_len = max(len(r) for r in tok_rows)
-        tokens = np.zeros((4, max_len), dtype=np.int32)
-        mask = np.zeros((4, max_len), dtype=np.int32)
-        for i, (tr, mr) in enumerate(zip(tok_rows, mask_rows)):
-            tokens[i, : len(tr)] = tr
-            mask[i, : len(mr)] = mr
-
-        return {
-            "tokens": tokens,
-            "mask": mask,
-            "label": np.int32(label),
-        }
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
@@ -450,44 +327,6 @@ def create_val_loader(cfg: "ConfigDict") -> grain.DataLoader | None:
     )
 
 
-def create_hellaswag_loader(
-    split: str = "val",
-    *,
-    batch_size: int = 1,
-) -> grain.DataLoader:
-    """Build a Grain :class:`~grain.python.DataLoader` for HellaSwag evaluation.
-
-    Uses :class:`HellaSwagSource` with :class:`~grain.python.ShardByJaxProcess`
-    so that each JAX process evaluates a unique subset of examples — useful for
-    distributed evaluation on multi-host setups.
-
-    Parameters
-    ----------
-    split:
-        ``"train"``, ``"val"``, or ``"test"``.
-    batch_size:
-        Examples per iteration.  Defaults to ``1`` because sequence lengths
-        vary across examples; increase only if you add a padding transform.
-
-    Returns
-    -------
-    A :class:`~grain.python.DataLoader` yielding dicts with keys
-    ``"tokens"``, ``"mask"``, and ``"label"``.
-    """
-    source = HellaSwagSource(split=split)
-    sampler = grain.IndexSampler(
-        len(source),
-        shard_options=grain.ShardByJaxProcess(drop_remainder=False),
-        shuffle=False,
-        num_epochs=1,
-        seed=0,
-    )
-    return grain.DataLoader(
-        data_source=source,
-        sampler=sampler,
-        operations=[grain.Batch(batch_size=batch_size, drop_remainder=False)],
-        worker_count=0,
-    )
 
 
 # ── Iterator checkpoint helpers ────────────────────────────────────────────────
